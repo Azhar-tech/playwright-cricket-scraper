@@ -91,14 +91,18 @@ def test_environment() -> dict | None:
     try:
         config = validate_env()
     except SystemExit:
-        _status("Load .env variables", False, "see error above")
+        _status("Load environment variables", False, "see error above")
         return None
 
-    _status("Load .env variables", True)
-    for key in ("TARGET_MATCH_URL", "FACEBOOK_PAGE_ID", "FACEBOOK_ACCESS_TOKEN", "GEMINI_API_KEY"):
+    _status("Load environment variables", True)
+    for key in ("TARGET_MATCH_URL", "FACEBOOK_PAGE_ID", "FACEBOOK_ACCESS_TOKEN"):
         masked = config[key][:8] + "..." if len(config[key]) > 8 else config[key]
         print(f"       {key} = {masked}")
     print(f"       TARGET_MATCH_URL = {config['TARGET_MATCH_URL']}")
+    if config.get("GEMINI_API_KEY"):
+        print("       GEMINI_API_KEY = (set, optional)")
+    else:
+        print("       GEMINI_API_KEY = (not set, optional)")
     return config
 
 

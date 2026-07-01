@@ -91,9 +91,13 @@ from post_builder import build_match_post
 
 
 
-ENV_PATH = Path(__file__).resolve().parent / ".env"
+_BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = _BASE_DIR / ".env"
 
-load_dotenv(ENV_PATH)
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+else:
+    load_dotenv()
 
 
 
@@ -240,8 +244,9 @@ PHASE_POST_HINTS = {
     ),
 }
 
-POST_STATE_PATH = Path(__file__).resolve().parent / ".post_state.json"
-LEGACY_PREVIEW_STORE_PATH = Path(__file__).resolve().parent / ".posted_previews.json"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(_BASE_DIR)))
+POST_STATE_PATH = DATA_DIR / ".post_state.json"
+LEGACY_PREVIEW_STORE_PATH = _BASE_DIR / ".posted_previews.json"
 PHASE_SORT_ORDER = {"live": 0, "toss": 1, "preview": 2, "result": 3}
 
 SCORE_PATTERN = re.compile(r"\d+/\d+")
@@ -313,6 +318,7 @@ def load_post_state() -> PostState:
 
 def save_post_state(state: PostState) -> None:
     try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "preview_posted": sorted(state.preview_posted),
             "result_posted": sorted(state.result_posted),
@@ -328,56 +334,31 @@ def save_post_state(state: PostState) -> None:
 
 
 def validate_env() -> dict[str, str]:
-
-    if not ENV_PATH.exists():
-
-        logger.error(".env file not found at %s", ENV_PATH)
-
-        sys.exit(1)
-
-
-
-    if ENV_PATH.stat().st_size == 0:
-
-        logger.error(
-
-            ".env file exists but is empty. Save your variables in %s and try again.",
-
-            ENV_PATH,
-
-        )
-
-        sys.exit(1)
-
-
+    if ENV_PATH.exists():
+        logger.info("Loaded .env from %s", ENV_PATH)
+    else:
+        logger.info("Using environment variables (no .env file)")
 
     required = [
-
         "TARGET_MATCH_URL",
-
         "FACEBOOK_PAGE_ID",
-
         "FACEBOOK_ACCESS_TOKEN",
-
-        "GEMINI_API_KEY",
-
     ]
-
     config = {key: os.getenv(key, "").strip() for key in required}
-
     missing = [key for key, value in config.items() if not value]
-
     if missing:
-
         logger.error("Missing required environment variables: %s", ", ".join(missing))
-
-        logger.error("Loaded .env from: %s", ENV_PATH)
-
-        logger.error("If values are in your editor, save the .env file (Ctrl+S) and rerun.")
-
+        if ENV_PATH.exists():
+            logger.error("Check variables in %s or set them in your deployment dashboard.", ENV_PATH)
+        else:
+            logger.error("Set them in your deployment dashboard or create a local .env file.")
         sys.exit(1)
 
-
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if gemini_key:
+        config["GEMINI_API_KEY"] = gemini_key
+    else:
+        logger.info("GEMINI_API_KEY not set; rule-based posting will be used (Gemini optional)")
 
     url = config["TARGET_MATCH_URL"]
 
@@ -385,7 +366,7 @@ def validate_env() -> dict[str, str]:
 
         logger.error(
 
-            "TARGET_MATCH_URL is still a placeholder. Set a real URL in .env, e.g. "
+            "TARGET_MATCH_URL is still a placeholder. Set a real URL, e.g. "
 
             "https://www.espncricinfo.com/live-cricket-score"
 
@@ -416,8 +397,10 @@ def get_genai_client() -> genai.Client:
     global _genai_client
 
     if _genai_client is None:
-
-        _genai_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set; Gemini post generation is unavailable")
+        _genai_client = genai.Client(api_key=api_key)
 
     return _genai_client
 
