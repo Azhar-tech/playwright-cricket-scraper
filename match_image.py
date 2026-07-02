@@ -70,6 +70,7 @@ CRICKET_IRELAND_ORG = re.compile(r"cricket\s+ireland", re.IGNORECASE)
 
 _BASE_DIR = Path(__file__).resolve().parent
 FLAGS_DIR = _BASE_DIR / "assets" / "flags"
+FONTS_DIR = _BASE_DIR / "assets" / "fonts"
 GENERATED_IMAGES_DIR = _BASE_DIR / "generated_images"
 
 IMAGE_WIDTH = 1080
@@ -308,8 +309,10 @@ def build_preview_caption(info: PreviewMatchInfo) -> str:
     return f"{headline}\n\n{tags}"
 
 
-def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    bundled = FONTS_DIR / ("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf")
     candidates = [
+        bundled,
         "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
         "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -318,10 +321,12 @@ def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageF
     ]
     for path in candidates:
         try:
-            return ImageFont.truetype(path, size)
+            return ImageFont.truetype(str(path), size)
         except OSError:
             continue
-    return ImageFont.load_default()
+    raise RuntimeError(
+        "No TrueType font found. Add DejaVuSans.ttf to assets/fonts/ or install fonts-dejavu-core."
+    )
 
 
 def _hex_rgb(hex_color: str) -> tuple[int, int, int]:

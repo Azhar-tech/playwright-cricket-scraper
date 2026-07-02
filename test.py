@@ -18,7 +18,7 @@ import requests
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
-from match_image import build_preview_caption, generate_preview_image, parse_preview_block
+from match_image import _load_font, build_preview_caption, generate_preview_image, parse_preview_block
 from post_builder import build_match_post, build_result_post
 from main import (
     TRACKED_TEAMS,
@@ -242,8 +242,27 @@ def test_preview_caption() -> bool:
     return ok
 
 
+def test_preview_fonts() -> bool:
+    print("\n=== 3e. Preview font loading ===")
+    from PIL import Image, ImageDraw, ImageFont
+
+    try:
+        font = _load_font(52, bold=True)
+    except RuntimeError as exc:
+        _status("Load bundled TrueType font", False, str(exc))
+        return False
+
+    is_truetype = isinstance(font, ImageFont.FreeTypeFont)
+    draw = ImageDraw.Draw(Image.new("RGB", (400, 100)))
+    bbox = draw.textbbox((0, 0), "England", font=font)
+    height = bbox[3] - bbox[1]
+    ok = is_truetype and height > 30
+    _status("Load bundled TrueType font", ok, f"bbox height={height}px")
+    return ok
+
+
 def test_preview_image_generation(keep_image: bool = False) -> bool:
-    print("\n=== 3e. Preview image generation ===")
+    print("\n=== 3f. Preview image generation ===")
     info = parse_preview_block(SAMPLE_PREVIEW_BLOCK.strip())
     try:
         path = generate_preview_image(info)
@@ -363,6 +382,7 @@ async def run(args: argparse.Namespace) -> int:
     multi_ok = test_multi_match_extraction()
     rules_ok = test_post_rules()
     caption_ok = test_preview_caption()
+    font_ok = test_preview_fonts()
     image_ok = test_preview_image_generation(keep_image=args.preview_image)
     posts_ok = test_rule_based_posts()
     gemini_input = extract_tracked_match_data(raw_data) or raw_data
@@ -376,7 +396,7 @@ async def run(args: argparse.Namespace) -> int:
         fb_ok = test_facebook(config, post=args.post)
 
     print("\n" + "=" * 40)
-    preview_ok = caption_ok and image_ok
+    preview_ok = caption_ok and font_ok and image_ok
     if fb_ok and multi_ok and rules_ok and preview_ok and posts_ok:
         if post_text and post_text != "rule-based":
             print("Summary: core pipeline OK (rule-based posts + optional Gemini).")
