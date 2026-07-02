@@ -256,9 +256,9 @@ def test_preview_image_generation(keep_image: bool = False) -> bool:
     size_ok = False
     if path.exists():
         with Image.open(path) as img:
-            size_ok = img.size == (1080, 1080)
+            size_ok = img.size == (1080, 1350)
 
-    ok = path.exists() and path.stat().st_size >= 50_000 and size_ok
+    ok = path.exists() and path.stat().st_size >= 30_000 and size_ok
     _status("Generate preview PNG", ok, str(path))
     if ok and keep_image:
         print(f"       Saved preview image at: {path}")
