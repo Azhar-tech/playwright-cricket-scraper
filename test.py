@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from datetime import date
 
 import requests
 from playwright.async_api import async_playwright
@@ -71,6 +72,15 @@ England
 India
 Match yet to begin
 9:30 PM local
+"""
+
+SAMPLE_TOMORROW_BLOCK = """
+Sri Lanka tour of West Indies 2026
+2nd Test, North Sound, July 03 - 07, 2026, Sri Lanka tour of West Indies
+West Indies
+Sri Lanka
+Match yet to begin
+TOMORROW, 7:00 PM
 """
 
 PASS = "PASS"
@@ -242,6 +252,32 @@ def test_preview_caption() -> bool:
     return ok
 
 
+def test_preview_tomorrow() -> bool:
+    print("\n=== 3d2. Tomorrow preview ===")
+    block = SAMPLE_TOMORROW_BLOCK.strip()
+    phase_ok = block_match_phase(block) == "tomorrow"
+    _status("Tomorrow block phase detection", phase_ok, block_match_phase(block))
+
+    info = parse_preview_block(block)
+
+    parse_ok = (
+        info.day_label == "tomorrow"
+        and info.match_date == date(2026, 7, 3)
+        and info.time_str == "7:00 PM"
+        and "Sri Lanka tour of West Indies 2026" in info.series
+        and info.venue == "North Sound"
+    )
+    _status("Tomorrow match parsed", parse_ok)
+    if parse_ok:
+        print(f"       Series: {info.series}")
+        print(f"       Match date: {info.match_date}")
+
+    caption = build_preview_caption(info)
+    caption_ok = caption.startswith("Tomorrow!") and "West Indies vs Sri Lanka" in caption
+    _status("Tomorrow caption prefix", caption_ok, caption.splitlines()[0] if caption_ok else caption[:80])
+    return phase_ok and parse_ok and caption_ok
+
+
 def test_preview_fonts() -> bool:
     print("\n=== 3e. Preview font loading ===")
     from PIL import Image, ImageDraw, ImageFont
@@ -382,6 +418,7 @@ async def run(args: argparse.Namespace) -> int:
     multi_ok = test_multi_match_extraction()
     rules_ok = test_post_rules()
     caption_ok = test_preview_caption()
+    tomorrow_ok = test_preview_tomorrow()
     font_ok = test_preview_fonts()
     image_ok = test_preview_image_generation(keep_image=args.preview_image)
     posts_ok = test_rule_based_posts()
@@ -396,7 +433,7 @@ async def run(args: argparse.Namespace) -> int:
         fb_ok = test_facebook(config, post=args.post)
 
     print("\n" + "=" * 40)
-    preview_ok = caption_ok and font_ok and image_ok
+    preview_ok = caption_ok and tomorrow_ok and font_ok and image_ok
     if fb_ok and multi_ok and rules_ok and preview_ok and posts_ok:
         if post_text and post_text != "rule-based":
             print("Summary: core pipeline OK (rule-based posts + optional Gemini).")

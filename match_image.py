@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -25,18 +25,32 @@ TRACKED_TEAMS = [
 ]
 
 TEAM_KITS: dict[str, tuple[str, str, str]] = {
-    "India": ("IND", "#004BA0", "#FF9933"),
-    "England": ("ENG", "#1E3A8A", "#FFFFFF"),
-    "Australia": ("AUS", "#FFCD00", "#00843D"),
-    "New Zealand": ("NZ", "#000000", "#FFFFFF"),
+    "India": ("IND", "#FF9933", "#138808"),
+    "England": ("ENG", "#FFFFFF", "#CE1124"),
+    "Australia": ("AUS", "#00008B", "#FFD700"),
+    "New Zealand": ("NZ", "#00247D", "#CC142B"),
     "South Africa": ("SA", "#007A4D", "#FFB612"),
-    "Pakistan": ("PAK", "#006600", "#FFFFFF"),
-    "West Indies": ("WI", "#750000", "#FFD700"),
-    "Bangladesh": ("BAN", "#006A4E", "#E30A17"),
-    "Sri Lanka": ("SL", "#003DA5", "#FFB81C"),
-    "Afghanistan": ("AFG", "#0066CC", "#000000"),
-    "Ireland": ("IRE", "#009A44", "#FFFFFF"),
-    "Zimbabwe": ("ZIM", "#C8102E", "#FFD700"),
+    "Pakistan": ("PAK", "#01411C", "#FFFFFF"),
+    "West Indies": ("WI", "#750000", "#D4AF37"),
+    "Bangladesh": ("BAN", "#006A4E", "#F42A41"),
+    "Sri Lanka": ("SL", "#8D153A", "#FFB500"),
+    "Afghanistan": ("AFG", "#000000", "#007A36"),
+    "Ireland": ("IRE", "#169B62", "#FFFFFF"),
+    "Zimbabwe": ("ZIM", "#DE2010", "#FFD200"),
+}
+
+# flagcdn.com ISO codes; england + west-indies use generated PNGs in assets/flags/
+FLAGCDN_CODES: dict[str, str] = {
+    "India": "in",
+    "Australia": "au",
+    "New Zealand": "nz",
+    "South Africa": "za",
+    "Pakistan": "pk",
+    "Bangladesh": "bd",
+    "Sri Lanka": "lk",
+    "Afghanistan": "af",
+    "Ireland": "ie",
+    "Zimbabwe": "zw",
 }
 
 TEAM_SLUGS: dict[str, str] = {
@@ -62,6 +76,10 @@ TIME_PATTERN = re.compile(r"\d{1,2}:\d{2}\s*(?:AM|PM)", re.IGNORECASE)
 DATE_PATTERN = re.compile(
     r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?\s*,?\s*"
     r"(\d{1,2}\s+\w+\s*,?\s*\d{4}|\w+\s+\d{1,2}\s*,?\s*\d{4})",
+    re.IGNORECASE,
+)
+DATE_RANGE_PATTERN = re.compile(
+    r"(\w+)\s+(\d{1,2})\s*-\s*(\d{1,2})\s*,?\s*(\d{4})",
     re.IGNORECASE,
 )
 FORMAT_PATTERN = re.compile(r"\b(T20I?|ODI|One\s*Day|Test)\b", re.IGNORECASE)
@@ -119,6 +137,8 @@ class PreviewMatchInfo:
     format_tag: str
     venue: str = "TBC"
     match_key: str = ""
+    day_label: str = "today"
+    match_date: date | None = None
 
 
 def _line_is_tracked_team(line: str) -> bool:
@@ -214,6 +234,100 @@ def _extract_venue_from_line(line: str) -> str:
     return ""
 
 
+def _parse_match_date(text: str) -> date | None:
+    range_match = DATE_RANGE_PATTERN.search(text)
+    if range_match:
+        month_name, day_start, _, year = range_match.groups()
+        month_num = MONTHS.get(month_name.lower())
+        if month_num:
+            return date(int(year), month_num, int(day_start))
+
+    for fmt in ("%d %B %Y", "%d %B, %Y", "%B %d %Y", "%B %d, %Y"):
+        try:
+            return datetime.strptime(text.strip(), fmt).date()
+        except ValueError:
+            continue
+
+    date_match = DATE_PATTERN.search(text)
+    if date_match:
+        raw = date_match.group(1).strip(" ,")
+        for fmt in ("%d %B %Y", "%d %B, %Y", "%B %d %Y", "%B %d, %Y"):
+            try:
+                return datetime.strptime(raw, fmt).date()
+            except ValueError:
+                continue
+        parts = re.match(r"(\d{1,2})\s+(\w+)\s*,?\s*(\d{4})", raw, re.IGNORECASE)
+        if parts:
+            day, month_name, year = parts.groups()
+            month_num = MONTHS.get(month_name.lower())
+            if month_num:
+                return date(int(year), month_num, int(day))
+        parts = re.match(r"(\w+)\s+(\d{1,2})\s*,?\s*(\d{4})", raw, re.IGNORECASE)
+        if parts:
+            month_name, day, year = parts.groups()
+            month_num = MONTHS.get(month_name.lower())
+            if month_num:
+                return date(int(year), month_num, int(day))
+    return None
+
+
+def parse_match_date_from_block(block: str) -> date | None:
+    for line in block.splitlines():
+        parsed = _parse_match_date(line.strip())
+        if parsed:
+            return parsed
+    return _parse_match_date(block)
+
+
+def _detect_day_label(block: str, match_date: date | None) -> str:
+    for line in block.splitlines():
+        upper = line.strip().upper()
+        if upper.startswith("TOMORROW,"):
+            return "tomorrow"
+        if upper.startswith("TODAY,"):
+            return "today"
+
+    today = date.today()
+    if match_date == today + timedelta(days=1):
+        return "tomorrow"
+    if match_date == today:
+        return "today"
+    return "today"
+
+
+def _extract_time(block: str) -> str:
+    for line in block.splitlines():
+        time_match = TIME_PATTERN.search(line)
+        if time_match:
+            return time_match.group(0).upper()
+    return "TBC"
+
+
+def _extract_series(lines: list[str], fixture_line: str) -> str:
+    for line in lines:
+        lower = line.lower()
+        if any(lower.startswith(p) for p in ("live", "result", "today,", "tomorrow,", "match yet", "match starts")):
+            continue
+        if _line_is_tracked_team(line) or MATCH_LABEL_PATTERN.search(line):
+            continue
+        if TIME_PATTERN.search(line) or SCORE_PATTERN.search(line):
+            continue
+        if (" tour " in lower or "tour of" in lower or re.search(r"\d{4}", line)) and len(line) > 5:
+            return line
+
+    if fixture_line:
+        parts = [part.strip() for part in fixture_line.split(",") if part.strip()]
+        for part in reversed(parts):
+            if DATE_RANGE_PATTERN.search(part) or DATE_PATTERN.search(part):
+                continue
+            if MATCH_LABEL_PATTERN.search(part) and len(parts) == 1:
+                continue
+            if len(part) > 5 and not _line_is_tracked_team(part):
+                return part
+
+    return "International Cricket"
+
+
 def parse_preview_block(block: str) -> PreviewMatchInfo:
     lines = [line.strip() for line in block.splitlines() if line.strip()]
     teams = [_normalize_team_name(line) for line in lines if _line_is_tracked_team(line)]
@@ -232,39 +346,27 @@ def parse_preview_block(block: str) -> PreviewMatchInfo:
                 venue = extracted
             break
 
-    time_str = "TBC"
-    for line in lines:
-        time_match = TIME_PATTERN.search(line)
-        if time_match:
-            time_str = time_match.group(0).upper()
-            break
+    time_str = _extract_time(block)
 
-    date_str = datetime.now().strftime("%A, %d %B")
-    for line in lines:
-        date_match = DATE_PATTERN.search(line)
-        if date_match:
-            raw = date_match.group(0).strip(" ,")
-            if raw.lower().startswith(
-                ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-            ):
-                date_str = raw
-            else:
-                date_str = f"{datetime.now():%A}, {raw}"
-            break
+    match_date = parse_match_date_from_block(block)
+    if match_date:
+        date_str = match_date.strftime("%A, %d %B")
+    else:
+        date_str = datetime.now().strftime("%A, %d %B")
+        for line in lines:
+            date_match = DATE_PATTERN.search(line)
+            if date_match:
+                raw = date_match.group(0).strip(" ,")
+                if raw.lower().startswith(
+                    ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+                ):
+                    date_str = raw
+                else:
+                    date_str = f"{datetime.now():%A}, {raw}"
+                break
 
-    series = "International Cricket"
-    skip_prefixes = ("live", "result", "today,", "tomorrow,", "match yet", "match starts")
-    for line in lines:
-        lower = line.lower()
-        if any(lower.startswith(p) for p in skip_prefixes):
-            continue
-        if _line_is_tracked_team(line) or MATCH_LABEL_PATTERN.search(line):
-            continue
-        if TIME_PATTERN.search(line) or SCORE_PATTERN.search(line):
-            continue
-        if len(line) > 5:
-            series = line
-            break
+    series = _extract_series(lines, fixture_line)
+    day_label = _detect_day_label(block, match_date)
 
     if venue == "TBC" and fixture_line:
         extracted = _extract_venue_from_line(fixture_line)
@@ -285,6 +387,8 @@ def parse_preview_block(block: str) -> PreviewMatchInfo:
         format_tag=_format_tag(fmt),
         venue=venue,
         match_key=match_key,
+        day_label=day_label,
+        match_date=match_date,
     )
 
 
@@ -292,8 +396,9 @@ def build_preview_caption(info: PreviewMatchInfo) -> str:
     abbrev1 = _team_abbrev(info.team1)
     abbrev2 = _team_abbrev(info.team2)
     series_tag = _hashtag_token(info.series)
+    prefix = "Tomorrow!" if info.day_label == "tomorrow" else "Today!"
     headline = (
-        f"Today! {info.team1} vs {info.team2}, {info.match_label} at {info.time_str} "
+        f"{prefix} {info.team1} vs {info.team2}, {info.match_label} at {info.time_str} "
         f"— {info.series}."
     )
     hashtags = [
@@ -373,15 +478,21 @@ def _parse_compact_date(date_str: str) -> str | None:
 
 
 def _compact_datetime(info: PreviewMatchInfo) -> str:
-    compact_date = _parse_compact_date(info.date_str)
-    if not compact_date:
-        now = datetime.now()
-        compact_date = f"{now.strftime('%b')} {now.day}"
+    if info.match_date:
+        compact_date = f"{info.match_date.strftime('%b')} {info.match_date.day}"
+    else:
+        compact_date = _parse_compact_date(info.date_str)
+        if not compact_date:
+            compact_date = None
 
     time_part = info.time_str.strip()
-    if time_part.upper() == "TBC":
+    if compact_date and time_part.upper() != "TBC":
+        return f"{compact_date}, {time_part.lower()}"
+    if compact_date:
         return compact_date
-    return f"{compact_date}, {time_part.lower()}"
+    if time_part.upper() != "TBC":
+        return time_part.lower()
+    return "TBC"
 
 
 def _rounded_flag_image(flag: Image.Image, width: int, height: int, radius: int) -> Image.Image:

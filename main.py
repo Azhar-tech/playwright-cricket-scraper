@@ -52,7 +52,7 @@ import sys
 import traceback
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from pathlib import Path
 
@@ -86,7 +86,12 @@ from playwright.async_api import (
 
 from playwright_stealth import Stealth
 
-from match_image import build_preview_caption, generate_preview_image, parse_preview_block
+from match_image import (
+    build_preview_caption,
+    generate_preview_image,
+    parse_match_date_from_block,
+    parse_preview_block,
+)
 from post_builder import build_match_post
 
 
@@ -247,7 +252,7 @@ PHASE_POST_HINTS = {
 DATA_DIR = Path(os.getenv("DATA_DIR", str(_BASE_DIR)))
 POST_STATE_PATH = DATA_DIR / ".post_state.json"
 LEGACY_PREVIEW_STORE_PATH = _BASE_DIR / ".posted_previews.json"
-PHASE_SORT_ORDER = {"live": 0, "toss": 1, "preview": 2, "result": 3}
+PHASE_SORT_ORDER = {"live": 0, "toss": 1, "preview": 2, "tomorrow": 2, "result": 3}
 
 SCORE_PATTERN = re.compile(r"\d+/\d+")
 FORMAT_PATTERN = re.compile(r"\b(T20I?|ODI|One\s*Day|Test)\b", re.IGNORECASE)
@@ -801,12 +806,23 @@ def block_match_phase(block: str) -> str:
         return "result"
     if first_upper.startswith("TODAY,"):
         return "preview"
-    if first_upper.startswith("TOMORROW,"):
+    if any(line.upper().startswith("TOMORROW,") for line in lines):
         return "tomorrow"
     if TOSS_PATTERN.search(block):
         return "toss"
+
+    match_date = parse_match_date_from_block(block)
+    tomorrow = date.today() + timedelta(days=1)
+    if match_date == tomorrow:
+        return "tomorrow"
+
     if UPCOMING_PATTERN.search(block) or "match yet to begin" in block.lower():
+        if match_date == date.today():
+            return "preview"
+        if match_date == tomorrow:
+            return "tomorrow"
         return "preview"
+
     if first_upper == "LIVE" or (
         SCORE_PATTERN.search(block) and "won by" not in block.lower()
     ):
@@ -823,7 +839,7 @@ def is_postable_block(block: str) -> bool:
         return False
 
     phase = block_match_phase(block)
-    if phase in ("live", "result", "toss", "preview"):
+    if phase in ("live", "result", "toss", "preview", "tomorrow"):
         return True
     return False
 
@@ -914,7 +930,7 @@ def make_preview_key(block: str) -> str:
 
 
 def should_post_one_shot(block: str, phase: str, state: PostState) -> bool:
-    if phase == "preview":
+    if phase in ("preview", "tomorrow"):
         return make_preview_key(block) not in state.preview_posted
     if phase == "result":
         return make_match_key(block) not in state.result_posted
@@ -950,7 +966,7 @@ def should_post_live(block: str, post_text: str, state: PostState) -> bool:
 
 
 def record_post_state(block: str, phase: str, post_text: str, state: PostState) -> None:
-    if phase == "preview":
+    if phase in ("preview", "tomorrow"):
         state.preview_posted.add(make_preview_key(block))
     elif phase == "result":
         state.result_posted.add(make_match_key(block))
@@ -1165,7 +1181,7 @@ async def run_cycle(
                 continue
 
             image_path: Path | None = None
-            if phase == "preview":
+            if phase in ("preview", "tomorrow"):
                 try:
                     info = parse_preview_block(block)
                     if not info.match_key:
@@ -1191,7 +1207,7 @@ async def run_cycle(
                 )
                 await asyncio.sleep(INTER_MATCH_POST_DELAY)
 
-            if phase == "preview" and image_path is not None:
+            if phase in ("preview", "tomorrow") and image_path is not None:
                 published = publish_photo_to_facebook(
                     post_text,
                     image_path,
