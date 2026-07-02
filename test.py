@@ -233,10 +233,12 @@ def test_preview_caption() -> bool:
         and "#ENGvsIND" in caption
         and "#CricketUpdates" in caption
         and "9:30 PM" in caption
+        and info.venue == "Chester-le-Street"
     )
     _status("Hashtag caption built", ok)
     if ok:
         print(f"       Caption preview: {caption.splitlines()[0]}")
+        print(f"       Venue parsed: {info.venue}")
     return ok
 
 
@@ -249,7 +251,14 @@ def test_preview_image_generation(keep_image: bool = False) -> bool:
         _status("Generate preview PNG", False, str(exc))
         return False
 
-    ok = path.exists() and path.stat().st_size > 1000
+    from PIL import Image
+
+    size_ok = False
+    if path.exists():
+        with Image.open(path) as img:
+            size_ok = img.size == (1080, 1080)
+
+    ok = path.exists() and path.stat().st_size >= 50_000 and size_ok
     _status("Generate preview PNG", ok, str(path))
     if ok and keep_image:
         print(f"       Saved preview image at: {path}")
