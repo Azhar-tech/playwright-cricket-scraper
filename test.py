@@ -19,7 +19,18 @@ import requests
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
-from match_image import _load_font, build_preview_caption, generate_preview_image, parse_preview_block
+from match_image import (
+    _load_font,
+    build_live_caption,
+    build_preview_caption,
+    build_result_caption,
+    build_toss_caption,
+    generate_match_image,
+    generate_preview_image,
+    make_live_signature,
+    parse_match_block,
+    parse_preview_block,
+)
 from post_builder import build_match_post, build_result_post
 from main import (
     TRACKED_TEAMS,
@@ -81,6 +92,73 @@ West Indies
 Sri Lanka
 Match yet to begin
 TOMORROW, 7:00 PM
+"""
+
+SAMPLE_RESULT_BLOCK = """
+RESULT
+ICC Women's T20 World Cup
+Semi-final · T20 32 of 33
+England Women
+169/5
+South Africa Women
+129/8
+ENG Women won by 40 runs
+"""
+
+SAMPLE_LIVE_BLOCK = """
+LIVE
+PAK vs IND, 2nd T20
+Pakistan
+41/1 (6/20 ov)
+Babar Azam 23 (12), Mohammad Rizwan 19 (13)
+India
+yet to bat
+"""
+
+SAMPLE_TOSS_BLOCK = """
+India tour of England 2026
+1st T20I (D/N)
+England
+India
+England won the toss and elected to bat
+Match starts 7:00 PM
+"""
+
+SAMPLE_LIVE_WITH_TOSS_BLOCK = """
+LIVE
+PAK vs IND, 2nd T20I
+Pakistan
+52/2 (6 ov)
+India
+Pakistan won the toss and elected to bowl first
+"""
+
+SAMPLE_LIVE_11_OV_BLOCK = """
+LIVE
+PAK vs IND, 2nd T20I
+Pakistan
+115/5 (11 ov)
+India
+Pakistan won the toss and elected to bowl first
+"""
+
+SAMPLE_INNINGS_BREAK_BLOCK = """
+LIVE
+PAK vs IND, 2nd T20I
+Pakistan
+180/7 (20 ov)
+India
+yet to bat
+"""
+
+SAMPLE_CHASE_BLOCK = """
+LIVE
+PAK vs IND, 2nd T20I
+Pakistan
+180/7
+India
+(4/20 ov, T:181) 35/1
+India need 146 runs from 94 balls
 """
 
 PASS = "PASS"
@@ -218,19 +296,37 @@ def test_post_rules() -> bool:
     _status("Preview skipped after posted", ok_preview_skip)
 
     live_block = "LIVE\nPAK vs IND\nPakistan\n41/1 (6 ov)\nIndia yet to bat"
-    ok_live_first = should_post_live(live_block, "PAK 41/1 after 6 ov", state)
+    sig = "live|41/1|(6)|||||Pakistan"
+    ok_live_first = should_post_live(live_block, sig, state)
     from datetime import datetime, timedelta
 
     state.live_last[make_match_key(live_block)] = {
         "at": datetime.now().isoformat(),
-        "text": "PAK 41/1 after 6 ov",
+        "text": "caption",
+        "signature": sig,
     }
-    ok_live_cooldown = not should_post_live(live_block, "PAK 41/1 after 6 ov", state)
+    ok_live_cooldown = not should_post_live(live_block, sig, state)
+
+    state.live_last[make_match_key(live_block)] = {
+        "at": (datetime.now() - timedelta(seconds=1900)).isoformat(),
+        "text": "caption",
+        "signature": sig,
+    }
+    ok_live_changed = should_post_live(live_block, "live|52/2|(6)|||||Pakistan", state)
     _status("Live post allowed (first time)", ok_live_first)
     _status("Live skipped during 30-min cooldown", ok_live_cooldown)
+    _status("Live allowed when score signature changed", ok_live_changed)
 
     return all(
-        [ok_result, ok_preview, ok_result_skip, ok_preview_skip, ok_live_first, ok_live_cooldown]
+        [
+            ok_result,
+            ok_preview,
+            ok_result_skip,
+            ok_preview_skip,
+            ok_live_first,
+            ok_live_cooldown,
+            ok_live_changed,
+        ]
     )
 
 
@@ -320,6 +416,136 @@ def test_preview_image_generation(keep_image: bool = False) -> bool:
     elif ok and not keep_image:
         path.unlink(missing_ok=True)
     return ok
+
+
+def test_match_image_generation(keep_image: bool = False) -> bool:
+    print("\n=== 3g. Match update image generation ===")
+    from PIL import Image
+
+    cases = [
+        ("result", SAMPLE_RESULT_BLOCK.strip()),
+        ("live", SAMPLE_LIVE_BLOCK.strip()),
+        ("toss", SAMPLE_TOSS_BLOCK.strip()),
+    ]
+    all_ok = True
+    for phase, block in cases:
+        try:
+            info = parse_match_block(block, phase)
+            path = generate_match_image(info)
+        except Exception as exc:
+            _status(f"Generate {phase} PNG", False, str(exc))
+            all_ok = False
+            continue
+
+        size_ok = False
+        if path.exists():
+            with Image.open(path) as img:
+                size_ok = img.size == (1080, 720)
+
+        ok = path.exists() and path.stat().st_size >= 10_000 and size_ok
+        _status(f"Generate {phase} PNG", ok, str(path))
+        if not ok:
+            all_ok = False
+        elif keep_image:
+            print(f"       Saved {phase} image at: {path}")
+        elif ok:
+            path.unlink(missing_ok=True)
+
+    result_info = parse_match_block(SAMPLE_RESULT_BLOCK.strip(), "result")
+    caption_ok = (
+        "Full time!" in build_result_caption(result_info)
+        and "won by 40 runs" in build_result_caption(result_info)
+    )
+    _status("Result caption built", caption_ok)
+
+    toss_info = parse_match_block(SAMPLE_TOSS_BLOCK.strip(), "toss")
+    toss_ok = "won the toss" in build_toss_caption(toss_info).lower()
+    _status("Toss caption built", toss_ok)
+
+    parse_ok = (
+        result_info.score1 == "169/5"
+        and result_info.score2 == "129/8"
+        and "won by 40 runs" in result_info.headline
+    )
+    _status("Result scores parsed", parse_ok, f"{result_info.score1} / {result_info.score2}")
+
+    return all_ok and caption_ok and toss_ok and parse_ok
+
+
+def test_live_posting_flow() -> bool:
+    print("\n=== 3h. Live posting flow ===")
+    toss_only = SAMPLE_TOSS_BLOCK.strip()
+    live_with_toss = SAMPLE_LIVE_WITH_TOSS_BLOCK.strip()
+
+    phase_toss = block_match_phase(toss_only) == "toss"
+    phase_live = block_match_phase(live_with_toss) == "live"
+    _status("Pre-match block is toss", phase_toss, block_match_phase(toss_only))
+    _status("Live block with toss text is live", phase_live, block_match_phase(live_with_toss))
+
+    info_6 = parse_match_block(live_with_toss, "live")
+    overs_ok = info_6.overs1 == "(6)" and info_6.score1 == "52/2"
+    _status("6-over score parsed", overs_ok, f"{info_6.score1} {info_6.overs1}")
+
+    info_11 = parse_match_block(SAMPLE_LIVE_11_OV_BLOCK.strip(), "live")
+    sig_6 = make_live_signature(info_6)
+    sig_11 = make_live_signature(info_11)
+    sig_ok = sig_6 != sig_11
+    _status("6 ov vs 11 ov signatures differ", sig_ok)
+
+    caption_6 = build_live_caption(info_6)
+    caption_ok = "after 6 overs" in caption_6 and "52/2" in caption_6
+    _status("Live caption mentions after 6 overs", caption_ok, caption_6.splitlines()[0][:80])
+
+    break_info = parse_match_block(SAMPLE_INNINGS_BREAK_BLOCK.strip(), "live")
+    break_ok = (
+        break_info.innings_status == "innings_break"
+        and break_info.target == 181
+        and "need 181 to win" in break_info.headline
+    )
+    _status("Innings break parsed", break_ok, break_info.headline[:80] if break_info.headline else "")
+
+    state = PostState()
+    break_key = make_match_key(SAMPLE_INNINGS_BREAK_BLOCK.strip())
+    ok_break_first = should_post_live(
+        SAMPLE_INNINGS_BREAK_BLOCK.strip(),
+        make_live_signature(break_info),
+        state,
+        innings_break=True,
+    )
+    state.innings_break_posted.add(break_key)
+    ok_break_skip = not should_post_live(
+        SAMPLE_INNINGS_BREAK_BLOCK.strip(),
+        make_live_signature(break_info),
+        state,
+        innings_break=True,
+    )
+    _status("Innings break post allowed once", ok_break_first)
+    _status("Innings break skipped if already posted", ok_break_skip)
+
+    chase_info = parse_match_block(SAMPLE_CHASE_BLOCK.strip(), "live")
+    chase_ok = (
+        chase_info.innings_status == "chase"
+        and chase_info.score2 == "35/1"
+        and chase_info.runs_needed == 146
+        and chase_info.balls_remaining == 94
+    )
+    chase_caption = build_live_caption(chase_info)
+    _status("Chase parsed", chase_ok, chase_caption.splitlines()[0][:90])
+
+    return all(
+        [
+            phase_toss,
+            phase_live,
+            overs_ok,
+            sig_ok,
+            caption_ok,
+            break_ok,
+            ok_break_first,
+            ok_break_skip,
+            chase_ok,
+            "146" in chase_caption,
+        ]
+    )
 
 
 def test_rule_based_posts() -> bool:
@@ -421,6 +647,8 @@ async def run(args: argparse.Namespace) -> int:
     tomorrow_ok = test_preview_tomorrow()
     font_ok = test_preview_fonts()
     image_ok = test_preview_image_generation(keep_image=args.preview_image)
+    match_image_ok = test_match_image_generation(keep_image=args.match_image)
+    live_flow_ok = test_live_posting_flow()
     posts_ok = test_rule_based_posts()
     gemini_input = extract_tracked_match_data(raw_data) or raw_data
     post_text = await test_gemini(gemini_input.split("\n\n---\n\n")[0])
@@ -433,7 +661,7 @@ async def run(args: argparse.Namespace) -> int:
         fb_ok = test_facebook(config, post=args.post)
 
     print("\n" + "=" * 40)
-    preview_ok = caption_ok and tomorrow_ok and font_ok and image_ok
+    preview_ok = caption_ok and tomorrow_ok and font_ok and image_ok and match_image_ok and live_flow_ok
     if fb_ok and multi_ok and rules_ok and preview_ok and posts_ok:
         if post_text and post_text != "rule-based":
             print("Summary: core pipeline OK (rule-based posts + optional Gemini).")
@@ -468,6 +696,11 @@ def main() -> None:
         "--preview-image",
         action="store_true",
         help="Keep generated preview PNG in generated_images/ for visual check",
+    )
+    parser.add_argument(
+        "--match-image",
+        action="store_true",
+        help="Keep generated result/live/toss PNGs in generated_images/ for visual check",
     )
     args = parser.parse_args()
     raise SystemExit(asyncio.run(run(args)))

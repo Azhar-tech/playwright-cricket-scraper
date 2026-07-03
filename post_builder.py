@@ -6,24 +6,17 @@ import re
 from typing import Optional
 
 from match_image import (
+    BATTER_PATTERN,
     FORMAT_PATTERN,
     MATCH_LABEL_PATTERN,
-    SCORE_PATTERN,
-    _line_is_tracked_team,
-    _normalize_team_name,
+    TOSS_PATTERN,
+    _result_line,
+    _scores_by_team_detailed,
     _team_abbrev,
+    _teams_from_block,
 )
 
 FACEBOOK_BG_CHAR_LIMIT = 130
-
-TOSS_PATTERN = re.compile(
-    r"((?:[\w\s]+)\s+won the toss|(?:[\w\s-]+)\s+(?:chose|opted|elected) to (?:bat|field|bowl)[^.]*)",
-    re.IGNORECASE,
-)
-OVERS_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*/\s*(\d+)\s*ov", re.IGNORECASE)
-BATTER_PATTERN = re.compile(
-    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(\d+)\s*\(\s*(\d+)\s*\)",
-)
 
 
 def _detect_format(text: str) -> str:
@@ -42,31 +35,6 @@ def _detect_format(text: str) -> str:
     return "ODI"
 
 
-def _is_score_line(line: str) -> bool:
-    lower = line.lower()
-    if "won by" in lower or "won the toss" in lower:
-        return False
-    if SCORE_PATTERN.search(line):
-        return True
-    if "&" in line and re.search(r"\d", line):
-        return True
-    if re.fullmatch(r"\d+", line.strip()):
-        return True
-    return False
-
-
-def _result_line(block: str) -> str:
-    for line in block.splitlines():
-        stripped = line.strip()
-        if re.search(r"\bwon by\b", stripped, re.IGNORECASE):
-            return stripped.rstrip(".")
-    return ""
-
-
-def _teams_from_block(block: str) -> list[str]:
-    return [_normalize_team_name(line) for line in block.splitlines() if _line_is_tracked_team(line)]
-
-
 def _short_match_label(block: str) -> str:
     for line in block.splitlines():
         match = MATCH_LABEL_PATTERN.search(line)
@@ -82,51 +50,18 @@ def _short_match_label(block: str) -> str:
     return "ODI"
 
 
-def _compact_score(line: str) -> str:
-    line = line.strip()
-    if not line:
-        return ""
-
-    overs = OVERS_PATTERN.search(line)
-    scores = SCORE_PATTERN.findall(line)
-    test_innings = re.findall(r"\d+(?:/\d+)?", line)
-
-    if "&" in line and len(test_innings) >= 2:
-        parts = re.findall(r"\d+(?:/\d+)?", line)
-        if parts:
-            return " & ".join(parts[:3])
-
-    if scores:
-        score = scores[-1]
-        if overs:
-            ov_num = overs.group(1)
-            return f"{score} ({ov_num} ov)"
-        return score
-
-    if re.fullmatch(r"\d+", line.strip()):
-        return line.strip()
-    return line[:24]
+def _compact_score_from_parts(score: str, overs: str) -> str:
+    if score and overs:
+        ov_num = overs.strip("()")
+        return f"{score} ({ov_num} ov)"
+    return score
 
 
 def _scores_by_team(block: str) -> list[tuple[str, str]]:
-    lines = [line.strip() for line in block.splitlines() if line.strip()]
-    paired: list[tuple[str, str]] = []
-    for i, line in enumerate(lines):
-        if not _line_is_tracked_team(line):
-            continue
-        team = _normalize_team_name(line)
-        for j in range(i + 1, min(i + 4, len(lines))):
-            nxt = lines[j]
-            if _line_is_tracked_team(nxt):
-                break
-            if "won by" in nxt.lower() or "won the toss" in nxt.lower():
-                break
-            if _is_score_line(nxt):
-                score = _compact_score(nxt)
-                if score:
-                    paired.append((team, score))
-                break
-    return paired
+    return [
+        (team, _compact_score_from_parts(score, overs))
+        for team, score, overs in _scores_by_team_detailed(block)
+    ]
 
 
 def _truncate(text: str, limit: int = FACEBOOK_BG_CHAR_LIMIT) -> str:

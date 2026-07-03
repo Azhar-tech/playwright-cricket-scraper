@@ -85,6 +85,29 @@ DATE_RANGE_PATTERN = re.compile(
 FORMAT_PATTERN = re.compile(r"\b(T20I?|ODI|One\s*Day|Test)\b", re.IGNORECASE)
 SCORE_PATTERN = re.compile(r"\d+/\d+")
 CRICKET_IRELAND_ORG = re.compile(r"cricket\s+ireland", re.IGNORECASE)
+TOSS_PATTERN = re.compile(
+    r"((?:[\w\s]+)\s+won the toss|(?:[\w\s-]+)\s+(?:chose|opted|elected) to (?:bat|field|bowl)[^.]*)",
+    re.IGNORECASE,
+)
+OVERS_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*/\s*(\d+)\s*ov", re.IGNORECASE)
+SIMPLE_OVERS_PATTERN = re.compile(r"\(\s*(\d+(?:\.\d+)?)\s*(?:ov|overs?)\s*\)", re.IGNORECASE)
+TARGET_PATTERN = re.compile(r"\bT:\s*(\d+)", re.IGNORECASE)
+NEED_RUNS_PATTERN = re.compile(
+    r"need\s+(\d+)\s+runs?(?:\s+(?:from|off|in)\s+(\d+)\s+(?:ball|balls|deliveries?))?",
+    re.IGNORECASE,
+)
+REQ_RUNS_PATTERN = re.compile(
+    r"(?:req(?:uired)?|need)[:\s]+(\d+)(?:\s+(?:runs?\s+)?(?:from|off|in)\s+(\d+)\s+(?:ball|balls|deliveries?))?",
+    re.IGNORECASE,
+)
+BATTER_PATTERN = re.compile(
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(\d+)\s*\(\s*(\d+)\s*\)",
+)
+MATCH_STAGE_PATTERN = re.compile(
+    r"\b(?:\d+(?:st|nd|rd|th)\s+(?:T20I?|ODI|One\s*Day|Test)(?:\s*\([^)]+\))?|"
+    r"(?:semi-final|quarter-final|final|qualifier|group\s+\w+))\b",
+    re.IGNORECASE,
+)
 
 _BASE_DIR = Path(__file__).resolve().parent
 FLAGS_DIR = _BASE_DIR / "assets" / "flags"
@@ -109,6 +132,23 @@ NAME_Y = 640
 MATCH_LABEL_Y = 780
 SERIES_Y = 840
 DATETIME_Y = 180
+
+UPDATE_IMAGE_WIDTH = 1080
+UPDATE_IMAGE_HEIGHT = 720
+UPDATE_FLAG_WIDTH = 120
+UPDATE_FLAG_HEIGHT = 84
+UPDATE_FLAG_RADIUS = 10
+UPDATE_LEFT_X = 140
+UPDATE_RIGHT_X = 940
+UPDATE_SCORE_LEFT_X = 400
+UPDATE_SCORE_RIGHT_X = 680
+UPDATE_FLAG_Y = 180
+UPDATE_NAME_Y = 280
+UPDATE_SCORE_Y = 200
+UPDATE_OVERS_Y = 275
+UPDATE_HEADLINE_Y = 400
+UPDATE_SUBLINE_Y = 455
+UPDATE_FOOTER_Y = 540
 
 MONTHS = {
     "january": 1,
@@ -139,6 +179,28 @@ class PreviewMatchInfo:
     match_key: str = ""
     day_label: str = "today"
     match_date: date | None = None
+
+
+@dataclass
+class MatchUpdateInfo:
+    team1: str
+    team2: str
+    series: str
+    match_label: str
+    format_tag: str
+    phase: str
+    score1: str = ""
+    overs1: str = ""
+    score2: str = ""
+    overs2: str = ""
+    headline: str = ""
+    subline: str = ""
+    match_key: str = ""
+    innings_status: str = "live"
+    target: int | None = None
+    runs_needed: int | None = None
+    balls_remaining: int | None = None
+    batting_team: str = ""
 
 
 def _line_is_tracked_team(line: str) -> bool:
@@ -214,6 +276,372 @@ def _hashtag_token(text: str) -> str:
 def _team_slug(team: str) -> str:
     base = team.replace(" Women", "")
     return TEAM_SLUGS.get(base, re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-"))
+
+
+def _teams_from_block(block: str) -> list[str]:
+    return [_normalize_team_name(line) for line in block.splitlines() if _line_is_tracked_team(line)]
+
+
+def _is_score_line(line: str) -> bool:
+    lower = line.lower()
+    if "won by" in lower or "won the toss" in lower:
+        return False
+    if SCORE_PATTERN.search(line):
+        return True
+    if "&" in line and re.search(r"\d", line):
+        return True
+    if re.fullmatch(r"\d+", line.strip()):
+        return True
+    return False
+
+
+def _parse_score_line(line: str, *, innings_complete: bool = False) -> tuple[str, str]:
+    line = line.strip()
+    if not line:
+        return "", ""
+
+    overs_match = OVERS_PATTERN.search(line)
+    simple_overs = SIMPLE_OVERS_PATTERN.search(line)
+    target_match = TARGET_PATTERN.search(line)
+    scores = SCORE_PATTERN.findall(line)
+
+    if "&" in line:
+        parts = re.findall(r"\d+(?:/\d+)?", line)
+        if parts:
+            return " & ".join(parts[:3]), ""
+
+    score = scores[-1] if scores else ""
+    if not score and re.fullmatch(r"\d+", line):
+        score = line
+
+    overs_display = ""
+    if overs_match:
+        completed, total = overs_match.group(1), overs_match.group(2)
+        try:
+            is_complete = innings_complete or float(completed) >= float(total)
+        except ValueError:
+            is_complete = innings_complete
+        if is_complete:
+            overs_display = f"({total})"
+        else:
+            overs_display = f"({completed})"
+    elif simple_overs:
+        overs_display = f"({simple_overs.group(1)})"
+
+    if target_match and not score and scores:
+        score = scores[-1]
+
+    return score, overs_display
+
+
+def _runs_from_score(score: str) -> int | None:
+    match = re.match(r"(\d+)/\d+", score)
+    return int(match.group(1)) if match else None
+
+
+def _parse_chase_meta(block: str) -> tuple[int | None, int | None, int | None]:
+    target: int | None = None
+    runs_needed: int | None = None
+    balls_remaining: int | None = None
+
+    for line in block.splitlines():
+        target_match = TARGET_PATTERN.search(line)
+        if target_match:
+            target = int(target_match.group(1))
+
+        for pattern in (NEED_RUNS_PATTERN, REQ_RUNS_PATTERN):
+            need_match = pattern.search(line)
+            if need_match:
+                runs_needed = int(need_match.group(1))
+                if need_match.lastindex and need_match.lastindex >= 2 and need_match.group(2):
+                    balls_remaining = int(need_match.group(2))
+                break
+
+    return target, runs_needed, balls_remaining
+
+
+def _team_yet_to_bat(block: str, team: str) -> bool:
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    for i, line in enumerate(lines):
+        if _normalize_team_name(line) != team:
+            continue
+        for j in range(i + 1, min(i + 4, len(lines))):
+            nxt = lines[j].lower()
+            if _line_is_tracked_team(lines[j]):
+                break
+            if "yet to bat" in nxt or "yet to bat" in nxt.replace(".", ""):
+                return True
+    return False
+
+
+def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
+    target, runs_needed, balls_remaining = _parse_chase_meta(block)
+
+    team2_yet_to_bat = _team_yet_to_bat(block, info.team2)
+    if info.score1 and team2_yet_to_bat and not info.score2:
+        info.innings_status = "innings_break"
+        runs = _runs_from_score(info.score1)
+        if runs is not None:
+            info.target = runs + 1
+        info.headline = (
+            f"{info.team1} {info.score1}"
+            + (f" {info.overs1}" if info.overs1 else "")
+            + f". {info.team2} need {info.target} to win"
+        )
+        return
+
+    chase_line = any("T:" in line.upper() for line in block.splitlines())
+    if chase_line or target is not None or runs_needed is not None:
+        info.innings_status = "chase"
+        info.target = target
+        info.runs_needed = runs_needed
+        info.balls_remaining = balls_remaining
+
+        if info.score2:
+            info.batting_team = info.team2
+            active_score, active_overs = info.score2, info.overs2
+        elif info.score1:
+            info.batting_team = info.team1
+            active_score, active_overs = info.score1, info.overs1
+        else:
+            active_score, active_overs = "", ""
+
+        if info.runs_needed is None and target is not None and active_score:
+            runs = _runs_from_score(active_score)
+            if runs is not None:
+                info.runs_needed = max(target - runs, 0)
+
+        parts = [f"LIVE: {_team_abbrev(info.batting_team)} {active_score}"]
+        if active_overs:
+            ov = active_overs.strip("()")
+            parts[0] += f" after {ov} overs"
+        if info.runs_needed is not None:
+            chase_part = f"need {info.runs_needed} runs"
+            if info.balls_remaining is not None:
+                chase_part += f" from {info.balls_remaining} balls"
+            parts.append(chase_part)
+        info.headline = " — ".join(parts)
+        return
+
+    if info.score1 and not info.score2:
+        info.batting_team = info.team1
+        ov = info.overs1.strip("()") if info.overs1 else ""
+        info.headline = f"LIVE: {_team_abbrev(info.team1)} {info.score1}"
+        if ov:
+            info.headline += f" after {ov} overs"
+    elif info.score2 and not info.score1:
+        info.batting_team = info.team2
+        ov = info.overs2.strip("()") if info.overs2 else ""
+        info.headline = f"LIVE: {_team_abbrev(info.team2)} {info.score2}"
+        if ov:
+            info.headline += f" after {ov} overs"
+    else:
+        info.headline = "LIVE"
+        batters = _extract_batters(block)
+        if batters:
+            info.subline = ", ".join(batters[:2])
+
+
+def make_live_signature(info: MatchUpdateInfo) -> str:
+    return "|".join(
+        [
+            info.innings_status,
+            info.score1,
+            info.overs1,
+            info.score2,
+            info.overs2,
+            str(info.target or ""),
+            str(info.runs_needed or ""),
+            str(info.balls_remaining or ""),
+            info.batting_team,
+        ]
+    )
+
+
+def _scores_by_team_detailed(block: str) -> list[tuple[str, str, str]]:
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    paired: list[tuple[str, str, str]] = []
+    for i, line in enumerate(lines):
+        if not _line_is_tracked_team(line):
+            continue
+        team = _normalize_team_name(line)
+        for j in range(i + 1, min(i + 4, len(lines))):
+            nxt = lines[j]
+            if _line_is_tracked_team(nxt):
+                break
+            if "won by" in nxt.lower() or "won the toss" in nxt.lower():
+                break
+            if "yet to bat" in nxt.lower():
+                break
+            if _is_score_line(nxt):
+                overs_match = OVERS_PATTERN.search(nxt)
+                innings_complete = False
+                if overs_match:
+                    try:
+                        innings_complete = float(overs_match.group(1)) >= float(overs_match.group(2))
+                    except ValueError:
+                        innings_complete = False
+                score, overs = _parse_score_line(nxt, innings_complete=innings_complete)
+                if score:
+                    paired.append((team, score, overs))
+                break
+    return paired
+
+
+def _result_line(block: str) -> str:
+    for line in block.splitlines():
+        stripped = line.strip()
+        if re.search(r"\bwon by\b", stripped, re.IGNORECASE):
+            return stripped.rstrip(".")
+    return ""
+
+
+def _extract_match_label(block: str, fmt: str) -> str:
+    for line in block.splitlines():
+        match = MATCH_LABEL_PATTERN.search(line)
+        if match:
+            label = re.sub(r"\s+", " ", match.group(0))
+            return label.replace("One Day", "ODI")
+        stage = MATCH_STAGE_PATTERN.search(line)
+        if stage:
+            return re.sub(r"\s+", " ", stage.group(0))
+    if fmt == "T20":
+        return "T20"
+    if fmt == "TEST":
+        return "Test"
+    return "ODI"
+
+
+def _extract_batters(block: str) -> list[str]:
+    batters: list[str] = []
+    for line in block.splitlines():
+        for match in BATTER_PATTERN.finditer(line):
+            name_parts = match.group(1).split()
+            short = name_parts[-1]
+            batters.append(f"{short} {match.group(2)}({match.group(3)})")
+        if len(batters) >= 2:
+            break
+    return batters
+
+
+def _match_hashtags(info: MatchUpdateInfo | PreviewMatchInfo) -> str:
+    abbrev1 = _team_abbrev(info.team1)
+    abbrev2 = _team_abbrev(info.team2)
+    series_tag = _hashtag_token(info.series)
+    hashtags = [
+        f"#{abbrev1}vs{abbrev2}",
+        f"#{abbrev2}vs{abbrev1}",
+        f"#{info.format_tag}",
+        f"#{series_tag}" if series_tag else "",
+        f"#Team{_hashtag_token(info.team1.replace(' Women', ''))}",
+        f"#Team{_hashtag_token(info.team2.replace(' Women', ''))}",
+        "#CricketUpdates",
+    ]
+    return " ".join(tag for tag in hashtags if tag)
+
+
+def parse_match_block(block: str, phase: str) -> MatchUpdateInfo:
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    teams = _teams_from_block(block)
+    if len(teams) < 2:
+        teams = (teams + ["TBD", "TBD"])[:2]
+
+    fixture_line = ""
+    for line in lines:
+        if MATCH_LABEL_PATTERN.search(line) or MATCH_STAGE_PATTERN.search(line):
+            fixture_line = line
+            break
+
+    series = _extract_series(lines, fixture_line)
+    fmt = _detect_format(block)
+    match_label = _extract_match_label(block, fmt)
+    team_key = "-".join(sorted(t.lower().replace(" ", "-") for t in teams[:2]))
+    match_key = f"{team_key}|{fmt}|{match_label}"
+
+    info = MatchUpdateInfo(
+        team1=teams[0],
+        team2=teams[1],
+        series=series,
+        match_label=match_label,
+        format_tag=_format_tag(fmt),
+        phase=phase,
+        match_key=match_key,
+    )
+
+    scores = _scores_by_team_detailed(block)
+    if scores:
+        info.score1, info.overs1 = scores[0][1], scores[0][2]
+        if len(scores) >= 2:
+            info.score2, info.overs2 = scores[1][1], scores[1][2]
+
+    if phase == "result":
+        info.headline = _result_line(block)
+    elif phase == "toss":
+        toss_match = TOSS_PATTERN.search(block)
+        if toss_match:
+            info.headline = toss_match.group(1).strip().rstrip(".")
+    elif phase == "live":
+        _populate_live_context(info, block)
+
+    return info
+
+
+def build_result_caption(info: MatchUpdateInfo) -> str:
+    headline = (
+        f"Full time! {info.team1} vs {info.team2}, {info.match_label}"
+    )
+    if info.headline:
+        headline += f" — {info.headline}."
+    else:
+        headline += "."
+    return f"{headline}\n\n{_match_hashtags(info)}"
+
+
+def build_live_caption(info: MatchUpdateInfo) -> str:
+    if info.innings_status == "innings_break" and info.headline:
+        headline = f"{info.headline}."
+    elif info.innings_status == "chase" and info.headline:
+        headline = f"{info.headline}."
+    elif info.headline and info.headline != "LIVE":
+        headline = f"{info.team1} vs {info.team2}, {info.match_label} — {info.headline}."
+    else:
+        parts = [f"LIVE: {info.team1} vs {info.team2}, {info.match_label}"]
+        batting = info.batting_team or info.team1
+        if batting == info.team1 and info.score1:
+            ov = info.overs1.strip("()") if info.overs1 else ""
+            score_part = f"— {_team_abbrev(info.team1)} {info.score1}"
+            if ov:
+                score_part += f" after {ov} overs"
+            parts.append(score_part)
+        elif batting == info.team2 and info.score2:
+            ov = info.overs2.strip("()") if info.overs2 else ""
+            score_part = f"— {_team_abbrev(info.team2)} {info.score2}"
+            if ov:
+                score_part += f" after {ov} overs"
+            parts.append(score_part)
+        if info.subline:
+            parts.append(f"({info.subline})")
+        headline = " ".join(parts) + "."
+    return f"{headline}\n\n{_match_hashtags(info)}"
+
+
+def build_toss_caption(info: MatchUpdateInfo) -> str:
+    headline = f"{info.team1} vs {info.team2}, {info.match_label}"
+    if info.headline:
+        headline += f" — {info.headline}."
+    else:
+        headline += "."
+    return f"{headline}\n\n{_match_hashtags(info)}"
+
+
+def build_update_caption(info: MatchUpdateInfo) -> str:
+    if info.phase == "result":
+        return build_result_caption(info)
+    if info.phase == "live":
+        return build_live_caption(info)
+    if info.phase == "toss":
+        return build_toss_caption(info)
+    raise ValueError(f"Unsupported phase: {info.phase}")
 
 
 def _extract_venue_from_line(line: str) -> str:
@@ -506,28 +934,39 @@ def _rounded_flag_image(flag: Image.Image, width: int, height: int, radius: int)
     return rounded
 
 
-def _fallback_flag(team: str, width: int, height: int) -> Image.Image:
+def _fallback_flag(
+    team: str,
+    width: int,
+    height: int,
+    radius: int = FLAG_RADIUS,
+) -> Image.Image:
     primary, _ = _team_kit_colors(team)
     img = Image.new("RGBA", (width, height), _hex_rgb(primary) + (255,))
     draw = ImageDraw.Draw(img)
-    font = _load_font(48, bold=True)
+    font_size = max(24, min(width, height) // 3)
+    font = _load_font(font_size, bold=True)
     abbrev = _team_abbrev(team)
     bbox = draw.textbbox((0, 0), abbrev, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     draw.text(((width - tw) // 2, (height - th) // 2 - 4), abbrev, font=font, fill="#FFFFFF")
-    return _rounded_flag_image(img, width, height, FLAG_RADIUS)
+    return _rounded_flag_image(img, width, height, radius)
 
 
-def _load_team_flag(team: str) -> Image.Image:
+def _load_team_flag(
+    team: str,
+    width: int = FLAG_WIDTH,
+    height: int = FLAG_HEIGHT,
+    radius: int = FLAG_RADIUS,
+) -> Image.Image:
     slug = _team_slug(team)
     path = FLAGS_DIR / f"{slug}.png"
     if path.exists():
         try:
             with Image.open(path) as flag:
-                return _rounded_flag_image(flag, FLAG_WIDTH, FLAG_HEIGHT, FLAG_RADIUS)
+                return _rounded_flag_image(flag, width, height, radius)
         except OSError:
             pass
-    return _fallback_flag(team, FLAG_WIDTH, FLAG_HEIGHT)
+    return _fallback_flag(team, width, height, radius)
 
 
 def _paste_flag_centered(base: Image.Image, flag: Image.Image, center_x: int, top_y: int) -> None:
@@ -567,6 +1006,125 @@ def _draw_flag_card(info: PreviewMatchInfo) -> Image.Image:
         _draw_centered_text(draw, series_line, IMAGE_WIDTH // 2, SERIES_Y, series_font, TEXT_MUTED)
 
     return img
+
+
+def _draw_match_update_card(info: MatchUpdateInfo) -> Image.Image:
+    img = Image.new("RGB", (UPDATE_IMAGE_WIDTH, UPDATE_IMAGE_HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(img)
+
+    name_font = _load_font(28, bold=True)
+    score_font = _load_font(64, bold=True)
+    overs_font = _load_font(28, bold=False)
+    headline_font = _load_font(36, bold=True)
+    subline_font = _load_font(26, bold=False)
+    footer_font = _load_font(28, bold=False)
+    badge_font = _load_font(24, bold=True)
+
+    left_flag = _load_team_flag(
+        info.team1,
+        UPDATE_FLAG_WIDTH,
+        UPDATE_FLAG_HEIGHT,
+        UPDATE_FLAG_RADIUS,
+    )
+    right_flag = _load_team_flag(
+        info.team2,
+        UPDATE_FLAG_WIDTH,
+        UPDATE_FLAG_HEIGHT,
+        UPDATE_FLAG_RADIUS,
+    )
+    _paste_flag_centered(img, left_flag, UPDATE_LEFT_X, UPDATE_FLAG_Y)
+    _paste_flag_centered(img, right_flag, UPDATE_RIGHT_X, UPDATE_FLAG_Y)
+
+    draw = ImageDraw.Draw(img)
+    _draw_centered_text(draw, info.team1, UPDATE_LEFT_X, UPDATE_NAME_Y, name_font, TEXT_PRIMARY)
+    _draw_centered_text(draw, info.team2, UPDATE_RIGHT_X, UPDATE_NAME_Y, name_font, TEXT_PRIMARY)
+
+    if info.phase == "toss":
+        _draw_centered_text(draw, "TOSS", UPDATE_IMAGE_WIDTH // 2, UPDATE_SCORE_Y, badge_font, TEXT_MUTED)
+        if info.headline:
+            headline = info.headline
+            if len(headline) > 70:
+                headline = headline[:67] + "..."
+            _draw_centered_text(
+                draw,
+                headline,
+                UPDATE_IMAGE_WIDTH // 2,
+                UPDATE_HEADLINE_Y,
+                headline_font,
+                TEXT_PRIMARY,
+            )
+    else:
+        score1 = info.score1 or "—"
+        score2 = info.score2 or "—"
+        _draw_centered_text(draw, score1, UPDATE_SCORE_LEFT_X, UPDATE_SCORE_Y, score_font, TEXT_PRIMARY)
+        _draw_centered_text(draw, score2, UPDATE_SCORE_RIGHT_X, UPDATE_SCORE_Y, score_font, TEXT_PRIMARY)
+        if info.overs1:
+            _draw_centered_text(draw, info.overs1, UPDATE_SCORE_LEFT_X, UPDATE_OVERS_Y, overs_font, TEXT_MUTED)
+        if info.overs2:
+            _draw_centered_text(draw, info.overs2, UPDATE_SCORE_RIGHT_X, UPDATE_OVERS_Y, overs_font, TEXT_MUTED)
+
+        if info.phase == "live":
+            if info.innings_status == "innings_break":
+                headline = info.headline
+                if len(headline) > 90:
+                    headline = headline[:87] + "..."
+                _draw_centered_text(
+                    draw,
+                    headline,
+                    UPDATE_IMAGE_WIDTH // 2,
+                    UPDATE_HEADLINE_Y,
+                    headline_font,
+                    TEXT_PRIMARY,
+                )
+            else:
+                _draw_centered_text(
+                    draw, "LIVE", UPDATE_IMAGE_WIDTH // 2, UPDATE_HEADLINE_Y - 30, badge_font, "#D93025"
+                )
+                display = info.headline if info.headline and info.headline != "LIVE" else info.subline
+                if display:
+                    if len(display) > 90:
+                        display = display[:87] + "..."
+                    _draw_centered_text(
+                        draw,
+                        display,
+                        UPDATE_IMAGE_WIDTH // 2,
+                        UPDATE_HEADLINE_Y,
+                        subline_font if info.subline and info.headline == "LIVE" else headline_font,
+                        TEXT_SECONDARY if info.subline and info.headline == "LIVE" else TEXT_PRIMARY,
+                    )
+        elif info.headline:
+            _draw_centered_text(
+                draw,
+                info.headline,
+                UPDATE_IMAGE_WIDTH // 2,
+                UPDATE_HEADLINE_Y,
+                headline_font,
+                TEXT_PRIMARY,
+            )
+
+    footer = info.match_label
+    if info.series and info.series not in footer and info.match_label not in info.series:
+        footer = f"{footer} · {info.series[:50]}"
+    elif info.series and info.match_label in info.series:
+        footer = info.series[:80]
+    _draw_centered_text(
+        draw,
+        footer[:80],
+        UPDATE_IMAGE_WIDTH // 2,
+        UPDATE_FOOTER_Y,
+        footer_font,
+        TEXT_MUTED,
+    )
+
+    return img
+
+
+def generate_match_image(info: MatchUpdateInfo) -> Path:
+    GENERATED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r"[^\w\-]", "_", info.match_key)[:80]
+    output_path = GENERATED_IMAGES_DIR / f"{info.phase}_{safe_key}.png"
+    _draw_match_update_card(info).save(output_path, "PNG")
+    return output_path
 
 
 def generate_preview_image(info: PreviewMatchInfo) -> Path:

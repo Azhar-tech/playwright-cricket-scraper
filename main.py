@@ -88,7 +88,11 @@ from playwright_stealth import Stealth
 
 from match_image import (
     build_preview_caption,
+    build_update_caption,
+    generate_match_image,
     generate_preview_image,
+    make_live_signature,
+    parse_match_block,
     parse_match_date_from_block,
     parse_preview_block,
 )
@@ -277,6 +281,7 @@ class PostState:
     preview_posted: set[str] = field(default_factory=set)
     result_posted: set[str] = field(default_factory=set)
     toss_posted: set[str] = field(default_factory=set)
+    innings_break_posted: set[str] = field(default_factory=set)
     live_last: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
@@ -306,6 +311,7 @@ def load_post_state() -> PostState:
             state.preview_posted = prune_old_preview_keys(set(data.get("preview_posted", [])))
             state.result_posted = set(data.get("result_posted", []))
             state.toss_posted = set(data.get("toss_posted", []))
+            state.innings_break_posted = set(data.get("innings_break_posted", []))
             state.live_last = dict(data.get("live_last", {}))
             return state
         except (json.JSONDecodeError, OSError, TypeError):
@@ -328,6 +334,7 @@ def save_post_state(state: PostState) -> None:
             "preview_posted": sorted(state.preview_posted),
             "result_posted": sorted(state.result_posted),
             "toss_posted": sorted(state.toss_posted),
+            "innings_break_posted": sorted(state.innings_break_posted),
             "live_last": state.live_last,
         }
         POST_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -808,8 +815,6 @@ def block_match_phase(block: str) -> str:
         return "preview"
     if any(line.upper().startswith("TOMORROW,") for line in lines):
         return "tomorrow"
-    if TOSS_PATTERN.search(block):
-        return "toss"
 
     match_date = parse_match_date_from_block(block)
     tomorrow = date.today() + timedelta(days=1)
@@ -824,10 +829,16 @@ def block_match_phase(block: str) -> str:
         return "preview"
 
     if first_upper == "LIVE" or (
-        SCORE_PATTERN.search(block) and "won by" not in block.lower()
+        SCORE_PATTERN.search(block)
+        and "won by" not in block.lower()
+        and not UPCOMING_PATTERN.search(block)
+        and "match yet to begin" not in block.lower()
     ):
-        if first_upper != "RESULT" and not UPCOMING_PATTERN.search(block):
-            return "live"
+        return "live"
+
+    if TOSS_PATTERN.search(block):
+        return "toss"
+
     return "other"
 
 
@@ -939,10 +950,23 @@ def should_post_one_shot(block: str, phase: str, state: PostState) -> bool:
     return True
 
 
-def should_post_live(block: str, post_text: str, state: PostState) -> bool:
+def should_post_live(
+    block: str,
+    signature: str,
+    state: PostState,
+    *,
+    innings_break: bool = False,
+) -> bool:
     key = make_match_key(block)
+    if innings_break and key in state.innings_break_posted:
+        logger.info("Innings break already posted for %s; skipping", key)
+        return False
+
     last = state.live_last.get(key)
     if not last:
+        return True
+
+    if innings_break:
         return True
 
     try:
@@ -959,13 +983,21 @@ def should_post_live(block: str, post_text: str, state: PostState) -> bool:
             max(0, POST_INTERVAL - int(elapsed)),
         )
         return False
-    if last.get("text") == post_text:
+    if last.get("signature") == signature or last.get("text") == signature:
         logger.info("Live match %s unchanged since last post; skipping", key)
         return False
     return True
 
 
-def record_post_state(block: str, phase: str, post_text: str, state: PostState) -> None:
+def record_post_state(
+    block: str,
+    phase: str,
+    post_text: str,
+    state: PostState,
+    *,
+    live_signature: str = "",
+    innings_break: bool = False,
+) -> None:
     if phase in ("preview", "tomorrow"):
         state.preview_posted.add(make_preview_key(block))
     elif phase == "result":
@@ -973,10 +1005,14 @@ def record_post_state(block: str, phase: str, post_text: str, state: PostState) 
     elif phase == "toss":
         state.toss_posted.add(make_match_key(block))
     elif phase == "live":
-        state.live_last[make_match_key(block)] = {
+        key = make_match_key(block)
+        state.live_last[key] = {
             "at": datetime.now().isoformat(),
             "text": post_text,
+            "signature": live_signature or post_text,
         }
+        if innings_break:
+            state.innings_break_posted.add(key)
     save_post_state(state)
 
 
@@ -1181,6 +1217,11 @@ async def run_cycle(
                 continue
 
             image_path: Path | None = None
+            post_text: str | None = None
+            use_photo = False
+            live_signature = ""
+            innings_break = False
+
             if phase in ("preview", "tomorrow"):
                 try:
                     info = parse_preview_block(block)
@@ -1188,16 +1229,44 @@ async def run_cycle(
                         info.match_key = match_key
                     image_path = generate_preview_image(info)
                     post_text = build_preview_caption(info)
+                    use_photo = True
                 except Exception as exc:
                     logger.error("Preview image generation failed: %s", exc)
                     continue
+            elif phase in ("result", "live", "toss"):
+                try:
+                    update_info = parse_match_block(block, phase)
+                    if not update_info.match_key:
+                        update_info.match_key = match_key
+                    if phase == "live":
+                        live_signature = make_live_signature(update_info)
+                        innings_break = update_info.innings_status == "innings_break"
+                    image_path = generate_match_image(update_info)
+                    post_text = build_update_caption(update_info)
+                    use_photo = True
+                except Exception as exc:
+                    logger.error("%s image generation failed: %s", phase, exc)
+                    post_text = build_match_post(block, phase=phase)
+                    if not post_text:
+                        logger.warning("Could not build %s post for %s", phase, match_key)
+                        continue
             else:
                 post_text = build_match_post(block, phase=phase)
                 if not post_text:
                     logger.warning("Could not build %s post for %s", phase, match_key)
                     continue
 
-            if phase == "live" and not should_post_live(block, post_text, _post_state):
+            if phase == "live" and post_text and not should_post_live(
+                block,
+                live_signature or post_text,
+                _post_state,
+                innings_break=innings_break,
+            ):
+                if image_path is not None:
+                    try:
+                        image_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 continue
 
             if posted_count > 0:
@@ -1207,7 +1276,7 @@ async def run_cycle(
                 )
                 await asyncio.sleep(INTER_MATCH_POST_DELAY)
 
-            if phase in ("preview", "tomorrow") and image_path is not None:
+            if use_photo and image_path is not None:
                 published = publish_photo_to_facebook(
                     post_text,
                     image_path,
@@ -1230,7 +1299,14 @@ async def run_cycle(
             if not published:
                 continue
 
-            record_post_state(block, phase, post_text, _post_state)
+            record_post_state(
+                block,
+                phase,
+                post_text,
+                _post_state,
+                live_signature=live_signature,
+                innings_break=innings_break,
+            )
             posted_count += 1
             logger.info("Posted (%s): %s", phase, post_text[:120])
 
