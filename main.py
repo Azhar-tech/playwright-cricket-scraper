@@ -383,6 +383,9 @@ def validate_env() -> dict[str, str]:
     else:
         logger.info("GEMINI_API_KEY not set; rule-based posting will be used (Gemini optional)")
 
+    display_tz = os.getenv("DISPLAY_TIMEZONE", "Asia/Karachi").strip() or "Asia/Karachi"
+    logger.info("Preview display timezone: %s", display_tz)
+
     url = config["TARGET_MATCH_URL"]
 
     if "..." in url or "your target match link" in url.lower():

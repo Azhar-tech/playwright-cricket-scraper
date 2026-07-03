@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+logger = logging.getLogger(__name__)
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -73,6 +78,61 @@ MATCH_LABEL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 TIME_PATTERN = re.compile(r"\d{1,2}:\d{2}\s*(?:AM|PM)", re.IGNORECASE)
+TODAY_TOMORROW_TIME = re.compile(
+    r"^(?:TODAY|TOMORROW),\s*(\d{1,2}:\d{2}\s*(?:AM|PM))",
+    re.IGNORECASE,
+)
+LOCAL_TIME_PATTERN = re.compile(
+    r"(\d{1,2}:\d{2}\s*(?:AM|PM))\s*local",
+    re.IGNORECASE,
+)
+
+# Venue keyword → IANA timezone for start-time conversion.
+VENUE_TIMEZONES: list[tuple[str, str]] = [
+    ("chester-le-street", "Europe/London"),
+    ("manchester", "Europe/London"),
+    ("london", "Europe/London"),
+    ("birmingham", "Europe/London"),
+    ("leeds", "Europe/London"),
+    ("southampton", "Europe/London"),
+    ("nottingham", "Europe/London"),
+    ("cardiff", "Europe/London"),
+    ("edinburgh", "Europe/London"),
+    ("dublin", "Europe/Dublin"),
+    ("north sound", "America/Antigua"),
+    ("bridgetown", "America/Barbados"),
+    ("gros islet", "America/St_Lucia"),
+    ("mumbai", "Asia/Kolkata"),
+    ("delhi", "Asia/Kolkata"),
+    ("new delhi", "Asia/Kolkata"),
+    ("ahmedabad", "Asia/Kolkata"),
+    ("chennai", "Asia/Kolkata"),
+    ("kolkata", "Asia/Kolkata"),
+    ("bengaluru", "Asia/Kolkata"),
+    ("hyderabad", "Asia/Kolkata"),
+    ("karachi", "Asia/Karachi"),
+    ("lahore", "Asia/Karachi"),
+    ("rawalpindi", "Asia/Karachi"),
+    ("sydney", "Australia/Sydney"),
+    ("melbourne", "Australia/Melbourne"),
+    ("perth", "Australia/Perth"),
+    ("brisbane", "Australia/Brisbane"),
+    ("adelaide", "Australia/Adelaide"),
+    ("auckland", "Pacific/Auckland"),
+    ("wellington", "Pacific/Auckland"),
+    ("christchurch", "Pacific/Auckland"),
+    ("johannesburg", "Africa/Johannesburg"),
+    ("centurion", "Africa/Johannesburg"),
+    ("cape town", "Africa/Johannesburg"),
+    ("durban", "Africa/Johannesburg"),
+    ("colombo", "Asia/Colombo"),
+    ("kandy", "Asia/Colombo"),
+    ("dhaka", "Asia/Dhaka"),
+    ("chattogram", "Asia/Dhaka"),
+    ("kabul", "Asia/Kabul"),
+    ("harare", "Africa/Harare"),
+    ("bulawayo", "Africa/Harare"),
+]
 DATE_PATTERN = re.compile(
     r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?\s*,?\s*"
     r"(\d{1,2}\s+\w+\s*,?\s*\d{4}|\w+\s+\d{1,2}\s*,?\s*\d{4})",
@@ -902,10 +962,66 @@ def _detect_day_label(block: str, match_date: date | None) -> str:
 
 def _extract_time(block: str) -> str:
     for line in block.splitlines():
+        header_match = TODAY_TOMORROW_TIME.match(line.strip())
+        if header_match:
+            return header_match.group(1).upper()
+
+    for line in block.splitlines():
+        local_match = LOCAL_TIME_PATTERN.search(line)
+        if local_match:
+            return local_match.group(1).upper()
+
+    for line in block.splitlines():
         time_match = TIME_PATTERN.search(line)
         if time_match:
             return time_match.group(0).upper()
     return "TBC"
+
+
+def _display_timezone() -> str:
+    return os.getenv("DISPLAY_TIMEZONE", "Asia/Karachi").strip() or "Asia/Karachi"
+
+
+def _venue_timezone(venue: str) -> str:
+    lower = venue.lower()
+    for keyword, tz_name in VENUE_TIMEZONES:
+        if keyword in lower:
+            return tz_name
+    logger.warning("Unknown venue timezone for %r; assuming UTC", venue)
+    return "UTC"
+
+
+def _format_clock_time(dt: datetime) -> str:
+    hour = dt.hour % 12 or 12
+    return f"{hour}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
+
+
+def _convert_preview_time(
+    time_str: str,
+    match_date: date | None,
+    venue: str,
+) -> tuple[str, date | None]:
+    if time_str == "TBC" or match_date is None or venue == "TBC":
+        return time_str, match_date
+
+    venue_tz_name = _venue_timezone(venue)
+    display_tz_name = _display_timezone()
+
+    try:
+        venue_tz = ZoneInfo(venue_tz_name)
+        display_tz = ZoneInfo(display_tz_name)
+    except ZoneInfoNotFoundError:
+        logger.warning("Invalid timezone for conversion: %s or %s", venue_tz_name, display_tz_name)
+        return time_str, match_date
+
+    try:
+        naive = datetime.strptime(f"{match_date.isoformat()} {time_str}", "%Y-%m-%d %I:%M %p")
+    except ValueError:
+        return time_str, match_date
+
+    localized = naive.replace(tzinfo=venue_tz)
+    converted = localized.astimezone(display_tz)
+    return _format_clock_time(converted), converted.date()
 
 
 def _extract_series(lines: list[str], fixture_line: str) -> str:
@@ -951,9 +1067,16 @@ def parse_preview_block(block: str) -> PreviewMatchInfo:
                 venue = extracted
             break
 
-    time_str = _extract_time(block)
+    venue_local_time = _extract_time(block)
+    raw_match_date = parse_match_date_from_block(block)
 
-    match_date = parse_match_date_from_block(block)
+    if venue == "TBC" and fixture_line:
+        extracted = _extract_venue_from_line(fixture_line)
+        if extracted:
+            venue = extracted
+
+    time_str, display_date = _convert_preview_time(venue_local_time, raw_match_date, venue)
+    match_date = display_date if display_date is not None else raw_match_date
     if match_date:
         date_str = match_date.strftime("%A, %d %B")
     else:
@@ -971,12 +1094,7 @@ def parse_preview_block(block: str) -> PreviewMatchInfo:
                 break
 
     series = _extract_series(lines, fixture_line)
-    day_label = _detect_day_label(block, match_date)
-
-    if venue == "TBC" and fixture_line:
-        extracted = _extract_venue_from_line(fixture_line)
-        if extracted:
-            venue = extracted
+    day_label = _detect_day_label(block, raw_match_date)
 
     fmt = _detect_format(block)
     team_key = "-".join(sorted(t.lower().replace(" ", "-") for t in teams[:2]))

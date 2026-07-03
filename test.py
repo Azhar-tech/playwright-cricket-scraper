@@ -20,6 +20,7 @@ from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 from match_image import (
+    _extract_time,
     _load_font,
     build_live_caption,
     build_preview_caption,
@@ -98,6 +99,16 @@ West Indies
 Sri Lanka
 Match yet to begin
 TOMORROW, 7:00 PM
+"""
+
+SAMPLE_TOMORROW_MULTI_TIME = """
+India tour of England 2026
+1:30 PM
+TOMORROW, 6:30 PM
+2nd T20I, Manchester, July 04, 2026
+England
+India
+Match yet to begin
 """
 
 SAMPLE_RESULT_BLOCK = """
@@ -400,8 +411,9 @@ def test_preview_caption() -> bool:
         "Today!" in caption
         and "#ENGvsIND" in caption
         and "#CricketUpdates" in caption
-        and "9:30 PM" in caption
+        and "1:30 AM" in caption
         and info.venue == "Chester-le-Street"
+        and info.match_date == date(2026, 7, 2)
     )
     _status("Hashtag caption built", ok)
     if ok:
@@ -420,8 +432,8 @@ def test_preview_tomorrow() -> bool:
 
     parse_ok = (
         info.day_label == "tomorrow"
-        and info.match_date == date(2026, 7, 3)
-        and info.time_str == "7:00 PM"
+        and info.match_date == date(2026, 7, 4)
+        and info.time_str == "4:00 AM"
         and "Sri Lanka tour of West Indies 2026" in info.series
         and info.venue == "North Sound"
     )
@@ -434,6 +446,29 @@ def test_preview_tomorrow() -> bool:
     caption_ok = caption.startswith("Tomorrow!") and "West Indies vs Sri Lanka" in caption
     _status("Tomorrow caption prefix", caption_ok, caption.splitlines()[0] if caption_ok else caption[:80])
     return phase_ok and parse_ok and caption_ok
+
+
+def test_preview_timezone() -> bool:
+    print("\n=== 3d3. Preview time extraction + timezone ===")
+    block = SAMPLE_TOMORROW_MULTI_TIME.strip()
+    extracted = _extract_time(block)
+    extract_ok = extracted == "6:30 PM"
+    _status("Prefer TOMORROW header time over US-converted time", extract_ok, extracted)
+
+    info = parse_preview_block(block)
+    convert_ok = (
+        info.time_str == "10:30 PM"
+        and info.match_date == date(2026, 7, 4)
+        and info.venue == "Manchester"
+        and info.day_label == "tomorrow"
+    )
+    _status("Convert venue local time to DISPLAY_TIMEZONE", convert_ok, f"{info.time_str} on {info.match_date}")
+
+    caption = build_preview_caption(info)
+    caption_ok = "10:30 PM" in caption and caption.startswith("Tomorrow!")
+    _status("Caption uses converted time", caption_ok, caption.splitlines()[0][:90])
+
+    return extract_ok and convert_ok and caption_ok
 
 
 def test_preview_fonts() -> bool:
@@ -825,6 +860,7 @@ async def run(args: argparse.Namespace) -> int:
     rules_ok = test_post_rules()
     caption_ok = test_preview_caption()
     tomorrow_ok = test_preview_tomorrow()
+    timezone_ok = test_preview_timezone()
     font_ok = test_preview_fonts()
     image_ok = test_preview_image_generation(keep_image=args.preview_image)
     match_image_ok = test_match_image_generation(keep_image=args.match_image)
@@ -846,6 +882,7 @@ async def run(args: argparse.Namespace) -> int:
     preview_ok = (
         caption_ok
         and tomorrow_ok
+        and timezone_ok
         and font_ok
         and image_ok
         and match_image_ok
