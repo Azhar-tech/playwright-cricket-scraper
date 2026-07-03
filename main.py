@@ -96,6 +96,14 @@ from match_image import (
     parse_match_date_from_block,
     parse_preview_block,
 )
+from playing_xi import (
+    PlayingXiPlayer,
+    build_playing_xi_caption,
+    build_playing_xi_info,
+    generate_playing_xi_image,
+    make_playing_xi_key,
+    parse_playing_xi_from_html,
+)
 from post_builder import build_match_post
 
 
@@ -282,6 +290,7 @@ class PostState:
     result_posted: set[str] = field(default_factory=set)
     toss_posted: set[str] = field(default_factory=set)
     innings_break_posted: set[str] = field(default_factory=set)
+    playing_xi_posted: set[str] = field(default_factory=set)
     live_last: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
@@ -312,6 +321,7 @@ def load_post_state() -> PostState:
             state.result_posted = set(data.get("result_posted", []))
             state.toss_posted = set(data.get("toss_posted", []))
             state.innings_break_posted = set(data.get("innings_break_posted", []))
+            state.playing_xi_posted = set(data.get("playing_xi_posted", []))
             state.live_last = dict(data.get("live_last", {}))
             return state
         except (json.JSONDecodeError, OSError, TypeError):
@@ -335,6 +345,7 @@ def save_post_state(state: PostState) -> None:
             "result_posted": sorted(state.result_posted),
             "toss_posted": sorted(state.toss_posted),
             "innings_break_posted": sorted(state.innings_break_posted),
+            "playing_xi_posted": sorted(state.playing_xi_posted),
             "live_last": state.live_last,
         }
         POST_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -482,7 +493,7 @@ async def new_stealth_page(browser: Browser) -> tuple[Page, BrowserContext]:
 
 
 
-async def scrape_match(page: Page, match_url: str) -> Optional[str]:
+async def scrape_match(page: Page, match_url: str) -> tuple[str | None, dict[str, str]]:
 
     try:
 
@@ -506,11 +517,11 @@ async def scrape_match(page: Page, match_url: str) -> Optional[str]:
 
     if "google.com/sorry" in page.url:
         logger.warning("Google CAPTCHA detected — bot blocked at %s", page.url)
-        return None
+        return None, {}
 
     if "access denied" in (await page.title()).lower():
         logger.warning("Access denied by site — try HEADLESS=false or stealth settings")
-        return None
+        return None, {}
 
     await _dismiss_cookie_banner(page)
 
@@ -548,7 +559,7 @@ async def scrape_match(page: Page, match_url: str) -> Optional[str]:
 
         logger.info("Page title: %s | URL: %s", title, page.url)
 
-        return None
+        return None, {}
 
 
 
@@ -560,11 +571,15 @@ async def scrape_match(page: Page, match_url: str) -> Optional[str]:
 
         logger.debug("Partial text: %s", raw_text[:500] if raw_text else "(empty)")
 
-        return None
+        return None, {}
 
 
 
-    return raw_text
+    match_links: dict[str, str] = {}
+    if "espncricinfo.com" in match_url.lower():
+        match_links = await extract_espn_match_links(page)
+
+    return raw_text, match_links
 
 
 
@@ -696,7 +711,174 @@ async def _extract_scorecard_text(page: Page, match_url: str) -> str:
     return "\n".join(trimmed or lines)
 
 
+async def extract_espn_match_links(page: Page) -> dict[str, str]:
+    """Map make_match_key values to ESPN match-page URLs from the live-score page."""
+    try:
+        entries = await page.evaluate(
+            """
+            () => {
+              const results = [];
+              const seen = new Set();
+              for (const a of document.querySelectorAll('a[href*="/game/"], a[href*="/full-scorecard"]')) {
+                const href = a.href;
+                if (!href || seen.has(href)) continue;
+                seen.add(href);
+                let el = a.closest('article, li, section, div');
+                for (let i = 0; i < 4 && el; i++) {
+                  const text = (el.innerText || '').trim();
+                  if (text.length > 20) break;
+                  el = el.parentElement;
+                }
+                const text = el ? el.innerText : (a.innerText || '');
+                results.push({ href, text: text.slice(0, 1200) });
+              }
+              return results;
+            }
+            """
+        )
+    except Exception as exc:
+        logger.warning("Could not extract ESPN match links: %s", exc)
+        return {}
 
+    links: dict[str, str] = {}
+    for entry in entries or []:
+        href = str(entry.get("href", "")).strip()
+        text = str(entry.get("text", "")).strip()
+        if not href or not text or not block_has_tracked_team(text):
+            continue
+        key = make_match_key(text)
+        if key not in links:
+            links[key] = href
+    return links
+
+
+async def fetch_playing_xi(
+    page: Page,
+    match_url: str,
+    team1: str,
+    team2: str,
+) -> dict[str, list[PlayingXiPlayer]]:
+    if not match_url:
+        return {}
+
+    try:
+        await page.goto(match_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+        await page.wait_for_load_state("networkidle", timeout=WIDGET_WAIT_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        logger.warning("Match page load timed out for Playing XI: %s", match_url)
+
+    await _dismiss_cookie_banner(page)
+    await asyncio.sleep(random.uniform(1.5, 3.0))
+
+    try:
+        html = await page.content()
+        body_text = await page.locator("body").inner_text(timeout=8000)
+    except PlaywrightTimeoutError:
+        logger.warning("Could not read match page content for Playing XI")
+        return {}
+
+    squads = parse_playing_xi_from_html(html, body_text, team1, team2)
+    return {team: players for team, players in squads.items() if len(players) >= 11}
+
+
+def _resolve_match_url(match_key: str, match_links: dict[str, str]) -> str:
+    if match_key in match_links:
+        return match_links[match_key]
+    key_teams = set(match_key.split("|")[0].split("-"))
+    for key, url in match_links.items():
+        link_teams = set(key.split("|")[0].split("-"))
+        if key_teams == link_teams:
+            return url
+    return ""
+
+
+def _playing_xi_pending(match_key: str, team1: str, team2: str, state: PostState) -> bool:
+    for team in (team1, team2):
+        if make_playing_xi_key(match_key, team) not in state.playing_xi_posted:
+            return True
+    return False
+
+
+async def post_playing_xi_if_ready(
+    block: str,
+    match_links: dict[str, str],
+    page: Page,
+    config: dict[str, str],
+    state: PostState,
+    *,
+    posted_count: int = 0,
+) -> int:
+    match_key = make_match_key(block)
+    if match_key not in state.toss_posted:
+        return posted_count
+
+    try:
+        match_info = parse_match_block(block, "toss")
+    except Exception:
+        return posted_count
+
+    team1, team2 = match_info.team1, match_info.team2
+    if not team1 or not team2:
+        return posted_count
+
+    if not _playing_xi_pending(match_key, team1, team2, state):
+        return posted_count
+
+    match_url = _resolve_match_url(match_key, match_links)
+    if not match_url:
+        logger.info("No ESPN match URL for %s; cannot fetch Playing XI yet", match_key)
+        return posted_count
+
+    logger.info("Fetching Playing XI from %s", match_url)
+    squads = await fetch_playing_xi(page, match_url, team1, team2)
+    if not squads:
+        logger.info("Playing XI not available yet for %s", match_key)
+        return posted_count
+
+    for team in (team1, team2):
+        xi_key = make_playing_xi_key(match_key, team)
+        if xi_key in state.playing_xi_posted:
+            continue
+        players = squads.get(team)
+        if not players or len(players) < 11:
+            logger.info("Incomplete Playing XI for %s (%d players)", team, len(players or []))
+            continue
+
+        opponent = team2 if team == team1 else team1
+        info = build_playing_xi_info(team, opponent, players, block, match_key)
+        try:
+            image_path = generate_playing_xi_image(info)
+            caption = build_playing_xi_caption(info)
+        except Exception as exc:
+            logger.error("Playing XI image failed for %s: %s", team, exc)
+            continue
+
+        if posted_count > 0:
+            logger.info("Waiting %ds before Playing XI post", INTER_MATCH_POST_DELAY)
+            await asyncio.sleep(INTER_MATCH_POST_DELAY)
+
+        published = publish_photo_to_facebook(
+            caption,
+            image_path,
+            config["FACEBOOK_PAGE_ID"],
+            config["FACEBOOK_ACCESS_TOKEN"],
+        )
+        if published:
+            try:
+                image_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            state.playing_xi_posted.add(xi_key)
+            save_post_state(state)
+            posted_count += 1
+            logger.info("Posted (playing_xi): %s", caption[:120])
+        else:
+            try:
+                image_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    return posted_count
 
 
 def _line_is_tracked_team(line: str) -> bool:
@@ -1187,7 +1369,7 @@ async def run_cycle(
 
     try:
 
-        raw_data = await scrape_match(page, config["TARGET_MATCH_URL"])
+        raw_data, match_links = await scrape_match(page, config["TARGET_MATCH_URL"])
 
         if not raw_data:
 
@@ -1196,6 +1378,8 @@ async def run_cycle(
 
 
         logger.info("Scraped match data (%d chars)", len(raw_data))
+        if match_links:
+            logger.info("Found %d ESPN match page link(s) for Playing XI", len(match_links))
 
         candidates = extract_all_postable_blocks(raw_data)
         if not candidates:
@@ -1207,6 +1391,7 @@ async def run_cycle(
 
         logger.info("Found %d tracked fixture(s)", len(candidates))
         posted_count = 0
+        xi_attempted: set[str] = set()
 
         for block, phase in candidates:
             match_key = make_match_key(block)
@@ -1309,6 +1494,36 @@ async def run_cycle(
             )
             posted_count += 1
             logger.info("Posted (%s): %s", phase, post_text[:120])
+
+            if phase == "toss":
+                xi_attempted.add(match_key)
+                posted_count = await post_playing_xi_if_ready(
+                    block,
+                    match_links,
+                    page,
+                    config,
+                    _post_state,
+                    posted_count=posted_count,
+                )
+
+        xi_blocks = normalize_match_blocks(raw_data)
+        for block in xi_blocks:
+            match_key = make_match_key(block)
+            if match_key in xi_attempted:
+                continue
+            if match_key not in _post_state.toss_posted:
+                continue
+            if not block_has_tracked_team(block):
+                continue
+            xi_attempted.add(match_key)
+            posted_count = await post_playing_xi_if_ready(
+                block,
+                match_links,
+                page,
+                config,
+                _post_state,
+                posted_count=posted_count,
+            )
 
         if posted_count == 0:
             logger.info("No new posts this cycle; waiting %ds", UNTRACKED_INTERVAL)

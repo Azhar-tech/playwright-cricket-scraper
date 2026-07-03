@@ -31,7 +31,13 @@ from match_image import (
     parse_match_block,
     parse_preview_block,
 )
-from post_builder import build_match_post, build_result_post
+from playing_xi import (
+    build_playing_xi_caption,
+    build_playing_xi_info,
+    generate_playing_xi_image,
+    make_playing_xi_key,
+    parse_playing_xi_from_match_text,
+)
 from main import (
     TRACKED_TEAMS,
     PostState,
@@ -161,6 +167,62 @@ India
 India need 146 runs from 94 balls
 """
 
+SAMPLE_FIRST_INNINGS_ODI = """
+LIVE
+India vs New Zealand, 2nd ODI
+India
+248/4 (45.0 ov)
+New Zealand
+Yet to Bat
+IND Current Run Rate: 5.51
+T. Boult 1/51 (9.0)
+R. Sharma 98* (122)
+"""
+
+SAMPLE_CHASE_ODI = """
+LIVE
+India vs New Zealand, 2nd ODI
+India
+284/7 (50 ov)
+New Zealand
+47/2 (12.5 ov)
+NZ need 238 runs in 37.1 overs to win
+CRR: 3.66
+RRR: 6.40
+P. Krishna 1/9 (1.5)
+W. Young 17* (31)
+"""
+
+SAMPLE_PLAYING_XI_TEXT = """
+Playing XI
+India tour of England 2026
+1st T20I (D/N)
+England
+1. Jos Buttler (c & wk)
+2. Phil Salt
+3. Dawid Malan
+4. Harry Brook
+5. Liam Livingstone
+6. Moeen Ali
+7. Sam Curran
+8. Chris Woakes
+9. Adil Rashid
+10. Mark Wood
+11. Reece Topley
+India
+1. Rohit Sharma (c)
+2. Yashasvi Jaiswal
+3. Shubman Gill
+4. Virat Kohli
+5. Shreyas Iyer
+6. Hardik Pandya
+7. Rishabh Pant (wk)
+8. Ravindra Jadeja
+9. Kuldeep Yadav
+10. Jasprit Bumrah
+11. Mohammed Siraj
+"""
+
 PASS = "PASS"
 FAIL = "FAIL"
 SKIP = "SKIP"
@@ -206,7 +268,7 @@ async def test_scrape(config: dict) -> str | None:
 
             page, ephemeral_context = await new_stealth_page(browser)  # type: ignore[arg-type]
         try:
-            raw = await scrape_match(page, config["TARGET_MATCH_URL"])
+            raw, _links = await scrape_match(page, config["TARGET_MATCH_URL"])
             final_url = page.url
         finally:
             await page.close()
@@ -440,7 +502,8 @@ def test_match_image_generation(keep_image: bool = False) -> bool:
         size_ok = False
         if path.exists():
             with Image.open(path) as img:
-                size_ok = img.size == (1080, 720)
+                expected_h = 900 if phase == "live" else 720
+                size_ok = img.size == (1080, expected_h)
 
         ok = path.exists() and path.stat().st_size >= 10_000 and size_ok
         _status(f"Generate {phase} PNG", ok, str(path))
@@ -548,6 +611,123 @@ def test_live_posting_flow() -> bool:
     )
 
 
+def test_innings_layouts(keep_image: bool = False) -> bool:
+    print("\n=== 3i. Innings-aware live layouts ===")
+    from PIL import Image
+
+    first_info = parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live")
+    first_ok = (
+        first_info.innings_status == "first_innings"
+        and first_info.score1 == "248/4"
+        and first_info.overs1 == "(45.0)"
+        and first_info.current_run_rate == "5.51"
+        and len(first_info.batters) >= 1
+        and len(first_info.bowlers) >= 1
+    )
+    _status("First innings ODI parsed", first_ok, first_info.innings_status)
+
+    chase_info = parse_match_block(SAMPLE_CHASE_ODI.strip(), "live")
+    chase_ok = (
+        chase_info.innings_status == "chase"
+        and chase_info.score1 == "284/7"
+        and chase_info.score2 == "47/2"
+        and chase_info.runs_needed == 238
+        and chase_info.overs_remaining == "37.1"
+        and chase_info.current_run_rate == "3.66"
+        and chase_info.required_run_rate == "6.40"
+    )
+    _status("Chase ODI parsed", chase_ok)
+
+    first_caption = build_live_caption(first_info)
+    cap_first = "CRR 5.51" in first_caption and "248/4" in first_caption
+    _status("First innings caption", cap_first, first_caption.splitlines()[0][:90])
+
+    chase_caption = build_live_caption(chase_info)
+    cap_chase = "238" in chase_caption and "RRR 6.40" in chase_caption
+    _status("Chase caption", cap_chase, chase_caption.splitlines()[0][:90])
+
+    img_ok = True
+    for label, info in (("first_innings", first_info), ("chase", chase_info)):
+        try:
+            path = generate_match_image(info)
+            with Image.open(path) as img:
+                ok = img.size == (1080, 900) and path.stat().st_size >= 10_000
+            _status(f"Generate {label} layout PNG", ok, str(path))
+            if not ok:
+                img_ok = False
+            elif keep_image:
+                print(f"       Saved {label} layout at: {path}")
+            elif ok:
+                path.unlink(missing_ok=True)
+        except Exception as exc:
+            _status(f"Generate {label} layout PNG", False, str(exc))
+            img_ok = False
+
+    sig_a = make_live_signature(parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live"))
+    block_45_5 = SAMPLE_FIRST_INNINGS_ODI.replace("45.0", "45.5")
+    sig_b = make_live_signature(parse_match_block(block_45_5.strip(), "live"))
+    _status("45.0 vs 45.5 signatures differ", sig_a != sig_b)
+
+    return first_ok and chase_ok and cap_first and cap_chase and img_ok and sig_a != sig_b
+
+
+def test_playing_xi(keep_image: bool = False) -> bool:
+    print("\n=== 3j. Playing XI cards ===")
+    from PIL import Image
+
+    team1, team2 = "England", "India"
+    squads = parse_playing_xi_from_match_text(SAMPLE_PLAYING_XI_TEXT.strip(), team1, team2)
+    eng_ok = len(squads.get("England", [])) == 11
+    ind_ok = len(squads.get("India", [])) == 11
+    _status("Parse 11 players per team", eng_ok and ind_ok, f"ENG={len(squads.get('England', []))}, IND={len(squads.get('India', []))}")
+
+    eng_captain = squads["England"][0].roles == "C+WK"
+    ind_captain = squads["India"][0].roles == "C"
+    ind_wk = any(p.roles == "WK" for p in squads["India"])
+    _status("Captain/wk roles parsed", eng_captain and ind_captain and ind_wk)
+
+    match_key = make_match_key(SAMPLE_TOSS_BLOCK.strip())
+    key_eng = make_playing_xi_key(match_key, "England")
+    key_ind = make_playing_xi_key(match_key, "India")
+    _status("Per-team dedup keys differ", key_eng != key_ind, f"{key_eng} vs {key_ind}")
+
+    block = SAMPLE_TOSS_BLOCK.strip()
+    img_ok = True
+    for team, opponent in (("England", "India"), ("India", "England")):
+        info = build_playing_xi_info(team, opponent, squads[team], block, match_key)
+        caption = build_playing_xi_caption(info)
+        cap_ok = _team_abbrev_in_caption(caption, team) and info.match_label in caption
+        _status(f"{team} caption", cap_ok, caption[:90])
+        try:
+            path = generate_playing_xi_image(info)
+            with Image.open(path) as img:
+                ok = img.size == (1080, 1350) and path.stat().st_size >= 10_000
+            _status(f"Generate {team} Playing XI PNG", ok, str(path))
+            if not ok:
+                img_ok = False
+            elif keep_image:
+                print(f"       Saved Playing XI at: {path}")
+            elif ok:
+                path.unlink(missing_ok=True)
+        except Exception as exc:
+            _status(f"Generate {team} Playing XI PNG", False, str(exc))
+            img_ok = False
+
+    state = PostState()
+    state.playing_xi_posted.add(key_eng)
+    skip_eng = key_eng in state.playing_xi_posted
+    allow_ind = key_ind not in state.playing_xi_posted
+    _status("Post state skips posted team", skip_eng and allow_ind)
+
+    return eng_ok and ind_ok and eng_captain and ind_captain and ind_wk and key_eng != key_ind and img_ok and skip_eng and allow_ind
+
+
+def _team_abbrev_in_caption(caption: str, team: str) -> bool:
+    from match_image import _team_abbrev
+
+    return _team_abbrev(team) in caption
+
+
 def test_rule_based_posts() -> bool:
     print("\n=== 4. Rule-based post generation ===")
     result_block = SAMPLE_MULTI_MATCH_DATA.strip().split("\n\n")[0]
@@ -649,6 +829,8 @@ async def run(args: argparse.Namespace) -> int:
     image_ok = test_preview_image_generation(keep_image=args.preview_image)
     match_image_ok = test_match_image_generation(keep_image=args.match_image)
     live_flow_ok = test_live_posting_flow()
+    innings_layout_ok = test_innings_layouts(keep_image=args.match_image)
+    playing_xi_ok = test_playing_xi(keep_image=args.playing_xi_image)
     posts_ok = test_rule_based_posts()
     gemini_input = extract_tracked_match_data(raw_data) or raw_data
     post_text = await test_gemini(gemini_input.split("\n\n---\n\n")[0])
@@ -661,7 +843,16 @@ async def run(args: argparse.Namespace) -> int:
         fb_ok = test_facebook(config, post=args.post)
 
     print("\n" + "=" * 40)
-    preview_ok = caption_ok and tomorrow_ok and font_ok and image_ok and match_image_ok and live_flow_ok
+    preview_ok = (
+        caption_ok
+        and tomorrow_ok
+        and font_ok
+        and image_ok
+        and match_image_ok
+        and live_flow_ok
+        and innings_layout_ok
+        and playing_xi_ok
+    )
     if fb_ok and multi_ok and rules_ok and preview_ok and posts_ok:
         if post_text and post_text != "rule-based":
             print("Summary: core pipeline OK (rule-based posts + optional Gemini).")
@@ -701,6 +892,11 @@ def main() -> None:
         "--match-image",
         action="store_true",
         help="Keep generated result/live/toss PNGs in generated_images/ for visual check",
+    )
+    parser.add_argument(
+        "--playing-xi-image",
+        action="store_true",
+        help="Keep generated Playing XI PNGs in generated_images/ for visual check",
     )
     args = parser.parse_args()
     raise SystemExit(asyncio.run(run(args)))
