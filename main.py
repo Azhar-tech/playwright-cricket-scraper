@@ -1096,6 +1096,17 @@ def split_preview_fixture_blocks(text: str) -> list[str]:
                 break
             if prev:
                 chunk.insert(0, prev)
+        for k in range(i + 1, min(len(lines), i + 5)):
+            nxt = lines[k]
+            if not nxt:
+                break
+            if ESPN_MATCH_START.match(nxt):
+                break
+            if SCORE_PATTERN.search(nxt) or re.search(r"\bwon by\b", nxt, re.IGNORECASE):
+                break
+            if k > i + 1 and _line_is_tracked_team(nxt):
+                break
+            chunk.append(nxt)
         block = "\n".join(chunk)
         if block_has_tracked_team(block):
             blocks.append(block)

@@ -62,6 +62,7 @@ from main import (
     scrape_match,
     should_post_live,
     should_post_one_shot,
+    split_preview_fixture_blocks,
     validate_env,
 )
 
@@ -127,6 +128,15 @@ Zimbabwe
 Bangladesh
 Match yet to begin
 Starts at 12:30 pm
+"""
+
+SAMPLE_PREVIEW_ZIM_BAN_BROKEN = """
+7:30 AM
+Bangladesh tour of Zimbabwe 2026
+1st ODI · Harare, July 06, 2026
+Zimbabwe
+Bangladesh
+Match yet to begin
 """
 
 SAMPLE_LIVE_TEST_WITH_TOSS = """
@@ -557,7 +567,24 @@ def test_preview_timezone() -> bool:
     )
     _status("ZIM vs BAN Google widget parsed", zim_ok, f"{zim_info.time_str}, {zim_info.venue}, {zim_info.series[:40]}")
 
-    return extract_ok and convert_ok and caption_ok and starts_ok and venue_ok and zim_ok
+    split_blocks = split_preview_fixture_blocks(SAMPLE_PREVIEW_GOOGLE_ZIM_BAN.strip())
+    zim_split = next((b for b in split_blocks if "Zimbabwe" in b and "Bangladesh" in b), "")
+    split_ok = bool(zim_split) and "Starts at 12:30 pm" in zim_split
+    _status("Preview block split includes Starts at line", split_ok, zim_split.splitlines()[-1] if zim_split else "none")
+
+    broken_info = parse_preview_block(SAMPLE_PREVIEW_ZIM_BAN_BROKEN.strip())
+    broken_ok = broken_info.time_str != "7:30 AM" and broken_info.time_str == "TBC"
+    _status("Broken block without Starts at skips orphan widget time", broken_ok, broken_info.time_str)
+
+    inferred_info = parse_preview_block(
+        "Bangladesh tour of Zimbabwe 2026\n"
+        "1st ODI, July 06, 2026\n"
+        "Zimbabwe\nBangladesh\nMatch yet to begin\nStarts at 12:30 pm"
+    )
+    infer_ok = inferred_info.venue == "Harare" and inferred_info.time_str == "3:30 PM"
+    _status("Infer Harare venue from tour and convert to PKT", infer_ok, f"{inferred_info.time_str}, {inferred_info.venue}")
+
+    return extract_ok and convert_ok and caption_ok and starts_ok and venue_ok and zim_ok and split_ok and broken_ok and infer_ok
 
 
 def test_playing_xi_triggers() -> bool:

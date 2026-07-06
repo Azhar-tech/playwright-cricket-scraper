@@ -137,6 +137,26 @@ VENUE_TIMEZONES: list[tuple[str, str]] = [
     ("harare", "Africa/Harare"),
     ("bulawayo", "Africa/Harare"),
 ]
+
+TEAM_HOME_VENUE: dict[str, str] = {
+    "India": "Delhi",
+    "England": "London",
+    "Australia": "Sydney",
+    "New Zealand": "Auckland",
+    "South Africa": "Johannesburg",
+    "Pakistan": "Karachi",
+    "West Indies": "North Sound",
+    "Bangladesh": "Dhaka",
+    "Sri Lanka": "Colombo",
+    "Afghanistan": "Kabul",
+    "Ireland": "Dublin",
+    "Zimbabwe": "Harare",
+}
+
+TOUR_OF_PATTERN = re.compile(
+    r"([\w\s]+?)\s+tour\s+of\s+([\w\s]+?)(?:\s+\d{4})?$",
+    re.IGNORECASE,
+)
 DATE_PATTERN = re.compile(
     r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?\s*,?\s*"
     r"(\d{1,2}\s+\w+\s*,?\s*\d{4}|\w+\s+\d{1,2}\s*,?\s*\d{4})",
@@ -1108,6 +1128,41 @@ def _detect_day_label(block: str, match_date: date | None) -> str:
     return "today"
 
 
+def _is_orphan_widget_time(line: str, line_idx: int, lines: list[str]) -> bool:
+    stripped = line.strip()
+    if not TIME_PATTERN.search(stripped):
+        return False
+    if STARTS_AT_PATTERN.search(stripped) or LOCAL_TIME_PATTERN.search(stripped):
+        return False
+    if TODAY_TOMORROW_TIME.match(stripped):
+        return False
+
+    anchor_idx = len(lines)
+    for idx, candidate in enumerate(lines):
+        if MATCH_LABEL_PATTERN.search(candidate):
+            anchor_idx = min(anchor_idx, idx)
+        lower = candidate.lower()
+        if "tour of" in lower or " tour " in lower:
+            anchor_idx = min(anchor_idx, idx)
+
+    return line_idx < anchor_idx
+
+
+def _infer_venue_from_context(series: str, team1: str, team2: str) -> str:
+    tour_match = TOUR_OF_PATTERN.search(series.strip())
+    if tour_match:
+        host = tour_match.group(2).strip()
+        for team, venue in TEAM_HOME_VENUE.items():
+            if team.lower() in host.lower():
+                return venue
+
+    for team in (team1, team2):
+        venue = TEAM_HOME_VENUE.get(team)
+        if venue:
+            return venue
+    return ""
+
+
 def _extract_time(block: str) -> str:
     for line in block.splitlines():
         starts_match = STARTS_AT_PATTERN.search(line)
@@ -1124,7 +1179,10 @@ def _extract_time(block: str) -> str:
         if local_match:
             return local_match.group(1).upper()
 
-    for line in block.splitlines():
+    lines = block.splitlines()
+    for idx, line in enumerate(lines):
+        if _is_orphan_widget_time(line, idx, lines):
+            continue
         time_match = TIME_PATTERN.search(line)
         if time_match:
             return time_match.group(0).upper()
@@ -1277,6 +1335,12 @@ def parse_preview_block(block: str) -> PreviewMatchInfo:
         if extracted:
             venue = extracted
 
+    series = _extract_series(lines, fixture_line, teams[0], teams[1])
+    if venue == "TBC":
+        inferred = _infer_venue_from_context(series, teams[0], teams[1])
+        if inferred:
+            venue = inferred
+
     time_str, display_date = _convert_preview_time(venue_local_time, raw_match_date, venue)
     match_date = display_date if display_date is not None else raw_match_date
     if match_date:
@@ -1295,7 +1359,6 @@ def parse_preview_block(block: str) -> PreviewMatchInfo:
                     date_str = f"{datetime.now():%A}, {raw}"
                 break
 
-    series = _extract_series(lines, fixture_line, teams[0], teams[1])
     day_label = _detect_day_label(block, raw_match_date)
 
     fmt = _detect_format(block)
