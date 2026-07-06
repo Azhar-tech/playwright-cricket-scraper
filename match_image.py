@@ -133,9 +133,24 @@ VENUE_TIMEZONES: list[tuple[str, str]] = [
     ("kandy", "Asia/Colombo"),
     ("dhaka", "Asia/Dhaka"),
     ("chattogram", "Asia/Dhaka"),
+    ("mirpur", "Asia/Dhaka"),
+    ("sylhet", "Asia/Dhaka"),
     ("kabul", "Asia/Kabul"),
     ("harare", "Africa/Harare"),
     ("bulawayo", "Africa/Harare"),
+    # Country-level fallbacks — matched when only the country name appears as venue
+    ("bangladesh", "Asia/Dhaka"),
+    ("sri lanka", "Asia/Colombo"),
+    ("zimbabwe", "Africa/Harare"),
+    ("afghanistan", "Asia/Kabul"),
+    ("ireland", "Europe/Dublin"),
+    ("england", "Europe/London"),
+    ("pakistan", "Asia/Karachi"),
+    ("india", "Asia/Kolkata"),
+    ("australia", "Australia/Sydney"),
+    ("new zealand", "Pacific/Auckland"),
+    ("south africa", "Africa/Johannesburg"),
+    ("west indies", "America/Antigua"),
 ]
 
 TEAM_HOME_VENUE: dict[str, str] = {
@@ -1155,11 +1170,6 @@ def _infer_venue_from_context(series: str, team1: str, team2: str) -> str:
         for team, venue in TEAM_HOME_VENUE.items():
             if team.lower() in host.lower():
                 return venue
-
-    for team in (team1, team2):
-        venue = TEAM_HOME_VENUE.get(team)
-        if venue:
-            return venue
     return ""
 
 

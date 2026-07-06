@@ -584,7 +584,25 @@ def test_preview_timezone() -> bool:
     infer_ok = inferred_info.venue == "Harare" and inferred_info.time_str == "3:30 PM"
     _status("Infer Harare venue from tour and convert to PKT", infer_ok, f"{inferred_info.time_str}, {inferred_info.venue}")
 
-    return extract_ok and convert_ok and caption_ok and starts_ok and venue_ok and zim_ok and split_ok and broken_ok and infer_ok
+    # Bangladesh home match — venue is Mirpur (UTC+6), 1:30 PM local → 12:30 PM PKT
+    mirpur_info = parse_preview_block(
+        "Zimbabwe tour of Bangladesh 2026\n"
+        "1st ODI, Mirpur, July 06, 2026\n"
+        "Bangladesh\nZimbabwe\nMatch yet to begin\nStarts at 1:30 pm"
+    )
+    mirpur_ok = mirpur_info.time_str == "12:30 PM" and "Mirpur" in mirpur_info.venue
+    _status("Mirpur (UTC+6) 1:30 PM converts to 12:30 PM PKT", mirpur_ok, f"{mirpur_info.time_str}, {mirpur_info.venue}")
+
+    # Bangladesh home match — only country name as venue fallback
+    ban_country_info = parse_preview_block(
+        "Zimbabwe tour of Bangladesh 2026\n"
+        "1st ODI, July 07, 2026\n"
+        "Bangladesh\nZimbabwe\nMatch yet to begin\nStarts at 1:30 pm"
+    )
+    ban_country_ok = ban_country_info.time_str == "12:30 PM"
+    _status("Bangladesh country-level venue fallback 1:30 PM -> 12:30 PM PKT", ban_country_ok, f"{ban_country_info.time_str}, {ban_country_info.venue}")
+
+    return extract_ok and convert_ok and caption_ok and starts_ok and venue_ok and zim_ok and split_ok and broken_ok and infer_ok and mirpur_ok and ban_country_ok
 
 
 def test_playing_xi_triggers() -> bool:
