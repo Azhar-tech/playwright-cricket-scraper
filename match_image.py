@@ -86,6 +86,10 @@ LOCAL_TIME_PATTERN = re.compile(
     r"(\d{1,2}:\d{2}\s*(?:AM|PM))\s*local",
     re.IGNORECASE,
 )
+STARTS_AT_PATTERN = re.compile(
+    r"starts?\s+at\s+(\d{1,2}:\d{2}\s*(?:AM|PM))",
+    re.IGNORECASE,
+)
 
 # Venue keyword → IANA timezone for start-time conversion.
 VENUE_TIMEZONES: list[tuple[str, str]] = [
@@ -179,6 +183,16 @@ BATTER_PATTERN = re.compile(
 BOWLER_PATTERN = re.compile(
     r"([A-Z][a-z]*(?:\.\s*[A-Z][a-z]+|[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?))\s+"
     r"(\d+/\d+)\s*\(\s*(\d+(?:\.\d+)?)\s*\)",
+)
+TEST_DAY_PATTERN = re.compile(
+    r"(?:\bday\s*(\d+)\b|(\d+)(?:st|nd|rd|th)\s+day\b|stumps.*?day\s*(\d+)|end\s+of\s+day\s*(\d+))",
+    re.IGNORECASE,
+)
+LUNCH_BREAK_PATTERN = re.compile(r"\blunch(?:\s+break)?\b|\binterval\b", re.IGNORECASE)
+TEA_BREAK_PATTERN = re.compile(r"\btea(?:\s+break)?\b", re.IGNORECASE)
+STUMPS_BREAK_PATTERN = re.compile(
+    r"\bstumps\b|end\s+of\s+(?:day|play)|close\s+of\s+play|play\s+suspended",
+    re.IGNORECASE,
 )
 MATCH_STAGE_PATTERN = re.compile(
     r"\b(?:\d+(?:st|nd|rd|th)\s+(?:T20I?|ODI|One\s*Day|Test)(?:\s*\([^)]+\))?|"
@@ -297,6 +311,8 @@ class MatchUpdateInfo:
     opponent_yet_to_bat: bool = False
     batters: list[str] = field(default_factory=list)
     bowlers: list[str] = field(default_factory=list)
+    test_day: int = 0
+    session_break: str = ""
 
 
 def _line_is_tracked_team(line: str) -> bool:
@@ -516,6 +532,81 @@ def _extract_bowlers(block: str) -> list[str]:
     return bowlers
 
 
+def _parse_test_day_from_block(block: str) -> int:
+    for line in block.splitlines():
+        match = TEST_DAY_PATTERN.search(line)
+        if match:
+            for group in match.groups():
+                if group:
+                    return int(group)
+
+    range_match = DATE_RANGE_PATTERN.search(block)
+    if range_match:
+        month_name, day_start, day_end, year = range_match.groups()
+        month_num = MONTHS.get(month_name.lower())
+        if month_num:
+            start = date(int(year), month_num, int(day_start))
+            end = date(int(year), month_num, int(day_end))
+            today = date.today()
+            if start <= today <= end:
+                return (today - start).days + 1
+
+    match_start = _parse_match_date(block)
+    if match_start and match_start <= date.today():
+        return (date.today() - match_start).days + 1
+    return 1
+
+
+def _detect_test_session(block: str) -> tuple[int, str]:
+    if _detect_format(block) != "TEST":
+        return 0, ""
+
+    session = ""
+    if STUMPS_BREAK_PATTERN.search(block):
+        session = "stumps"
+    elif TEA_BREAK_PATTERN.search(block):
+        session = "tea"
+    elif LUNCH_BREAK_PATTERN.search(block):
+        session = "lunch"
+    if not session:
+        return 0, ""
+    return _parse_test_day_from_block(block), session
+
+
+def _apply_test_session_headline(info: MatchUpdateInfo, block: str) -> None:
+    day = info.test_day or 1
+    label = info.session_break.capitalize()
+    score_parts: list[str] = []
+
+    if info.score1:
+        part = f"{_team_abbrev(info.team1)} {info.score1}"
+        if info.overs1:
+            part += f" ({info.overs1.strip('()')} ov)"
+        score_parts.append(part)
+    elif _team_yet_to_bat(block, info.team1):
+        score_parts.append(f"{_team_abbrev(info.team1)} yet to bat")
+
+    if info.score2:
+        part = f"{_team_abbrev(info.team2)} {info.score2}"
+        if info.overs2:
+            part += f" ({info.overs2.strip('()')} ov)"
+        score_parts.append(part)
+    elif _team_yet_to_bat(block, info.team2):
+        score_parts.append(f"{_team_abbrev(info.team2)} yet to bat")
+
+    if score_parts:
+        info.headline = f"Day {day} — {label}: {', '.join(score_parts)}"
+    else:
+        info.headline = f"Day {day} — {label}"
+
+
+def _live_badge_text(info: MatchUpdateInfo) -> str:
+    if info.session_break:
+        day = info.test_day or 1
+        return f"DAY {day} — {info.session_break.upper()}"
+    return "LIVE"
+
+
 def _team_yet_to_bat(block: str, team: str) -> bool:
     lines = [line.strip() for line in block.splitlines() if line.strip()]
     for i, line in enumerate(lines):
@@ -528,6 +619,17 @@ def _team_yet_to_bat(block: str, team: str) -> bool:
             if "yet to bat" in nxt or "yet to bat" in nxt.replace(".", ""):
                 return True
     return False
+
+
+def _finalize_test_session(info: MatchUpdateInfo, block: str, fmt: str) -> None:
+    if fmt != "TEST":
+        return
+    test_day, session_break = _detect_test_session(block)
+    if not session_break:
+        return
+    info.test_day = test_day
+    info.session_break = session_break
+    _apply_test_session_headline(info, block)
 
 
 def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
@@ -568,6 +670,7 @@ def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
                 )
             else:
                 info.headline = f"{abbrev} need {info.runs_needed} runs to win"
+        _finalize_test_session(info, block, fmt)
         return
 
     if runs_needed is not None or overs_remaining:
@@ -580,6 +683,7 @@ def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
         abbrev = _team_abbrev(info.batting_team)
         if info.overs_remaining:
             info.headline = f"{abbrev} need {runs_needed} runs in {overs_remaining} overs to win"
+        _finalize_test_session(info, block, fmt)
         return
 
     if info.score1 and team2_yet and not info.score2:
@@ -605,6 +709,7 @@ def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
                 info.headline = f"LIVE: {_team_abbrev(info.team1)} {info.score1} after {ov} overs"
             else:
                 info.headline = f"LIVE: {_team_abbrev(info.team1)} {info.score1}"
+        _finalize_test_session(info, block, fmt)
         return
 
     if info.score2 and team1_yet and not info.score1:
@@ -630,6 +735,7 @@ def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
                 info.headline = f"LIVE: {_team_abbrev(info.team2)} {info.score2} after {ov} overs"
             else:
                 info.headline = f"LIVE: {_team_abbrev(info.team2)} {info.score2}"
+        _finalize_test_session(info, block, fmt)
         return
 
     if info.score1 and not info.score2:
@@ -651,10 +757,14 @@ def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
         if info.batters:
             info.subline = ", ".join(info.batters[:2])
 
+    _finalize_test_session(info, block, fmt)
+
 
 def make_live_signature(info: MatchUpdateInfo) -> str:
     return "|".join(
         [
+            str(info.test_day or ""),
+            info.session_break,
             info.innings_status,
             info.score1,
             info.overs1,
@@ -755,7 +865,7 @@ def parse_match_block(block: str, phase: str) -> MatchUpdateInfo:
             fixture_line = line
             break
 
-    series = _extract_series(lines, fixture_line)
+    series = _extract_series(lines, fixture_line, teams[0], teams[1])
     fmt = _detect_format(block)
     match_label = _extract_match_label(block, fmt)
     team_key = "-".join(sorted(t.lower().replace(" ", "-") for t in teams[:2]))
@@ -807,7 +917,9 @@ def build_live_caption(info: MatchUpdateInfo) -> str:
     if info.bowlers:
         player_bits.extend(info.bowlers[:2])
 
-    if info.innings_status == "first_innings":
+    if info.session_break and info.headline:
+        headline = info.headline if info.headline.endswith(".") else f"{info.headline}."
+    elif info.innings_status == "first_innings":
         ov = info.overs1.strip("()") if info.overs1 else ""
         headline = f"LIVE: {info.team1} vs {info.team2} — {_team_abbrev(info.batting_team)} {info.score1}"
         if ov:
@@ -884,6 +996,13 @@ def build_update_caption(info: MatchUpdateInfo) -> str:
 def _extract_venue_from_line(line: str) -> str:
     if not MATCH_LABEL_PATTERN.search(line):
         return ""
+
+    if "·" in line:
+        after_dot = line.split("·", 1)[1].strip()
+        candidate = after_dot.split(",")[0].strip()
+        if candidate and not _looks_like_date(candidate):
+            return candidate
+
     parts = [part.strip() for part in line.split(",") if part.strip()]
     if len(parts) < 2:
         return ""
@@ -891,12 +1010,29 @@ def _extract_venue_from_line(line: str) -> str:
         if DATE_PATTERN.search(part):
             if idx > 0:
                 candidate = parts[idx - 1]
-                if not DATE_PATTERN.search(candidate) and not TIME_PATTERN.search(candidate):
+                if (
+                    not _looks_like_date(candidate)
+                    and not DATE_PATTERN.search(candidate)
+                    and not TIME_PATTERN.search(candidate)
+                ):
                     return candidate
             break
-    if len(parts) >= 2 and not DATE_PATTERN.search(parts[1]):
+    if len(parts) >= 2 and not _looks_like_date(parts[1]) and not DATE_PATTERN.search(parts[1]):
         return parts[1]
     return ""
+
+
+def _looks_like_date(text: str) -> bool:
+    stripped = text.strip()
+    if re.fullmatch(r"\d{4}", stripped):
+        return True
+    if DATE_PATTERN.search(stripped):
+        return True
+    if re.fullmatch(r"\w+\s+\d{1,2}", stripped, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"\d{1,2}\s+\w+", stripped, re.IGNORECASE):
+        return True
+    return False
 
 
 def _parse_match_date(text: str) -> date | None:
@@ -953,6 +1089,18 @@ def _detect_day_label(block: str, match_date: date | None) -> str:
             return "today"
 
     today = date.today()
+    if _detect_format(block) == "TEST" and match_date:
+        if today > match_date:
+            return "today"
+        range_match = DATE_RANGE_PATTERN.search(block)
+        if range_match:
+            month_name, day_start, day_end, year = range_match.groups()
+            month_num = MONTHS.get(month_name.lower())
+            if month_num:
+                start = date(int(year), month_num, int(day_start))
+                if today > start:
+                    return "today"
+
     if match_date == today + timedelta(days=1):
         return "tomorrow"
     if match_date == today:
@@ -961,6 +1109,11 @@ def _detect_day_label(block: str, match_date: date | None) -> str:
 
 
 def _extract_time(block: str) -> str:
+    for line in block.splitlines():
+        starts_match = STARTS_AT_PATTERN.search(line)
+        if starts_match:
+            return starts_match.group(1).upper()
+
     for line in block.splitlines():
         header_match = TODAY_TOMORROW_TIME.match(line.strip())
         if header_match:
@@ -1024,7 +1177,46 @@ def _convert_preview_time(
     return _format_clock_time(converted), converted.date()
 
 
-def _extract_series(lines: list[str], fixture_line: str) -> str:
+def _series_matches_teams(line: str, team1: str, team2: str) -> int:
+    lower = line.lower()
+    score = 0
+    for team in (team1, team2):
+        base = team.replace(" Women", "").lower()
+        if base and base in lower:
+            score += 2
+    if "tour of" in lower or " tour " in lower:
+        score += 1
+    if re.search(r"\d{4}", line):
+        score += 1
+    if re.search(r"under-19|under 19|\bu19\b", lower):
+        senior_match = not any(
+            re.search(r"under-19|under 19|\bu19\b", team, re.IGNORECASE) for team in (team1, team2)
+        )
+        if senior_match:
+            score -= 10
+    return score
+
+
+def _fixture_series_parts(fixture_line: str) -> list[str]:
+    if not fixture_line:
+        return []
+    parts: list[str] = []
+    for segment in re.split(r"[,·]", fixture_line):
+        part = segment.strip()
+        if (
+            part
+            and len(part) > 5
+            and not MATCH_LABEL_PATTERN.search(part)
+            and not _looks_like_date(part)
+            and not DATE_PATTERN.search(part)
+            and (" tour " in part.lower() or "tour of" in part.lower() or re.search(r"\d{4}", part))
+        ):
+            parts.append(part)
+    return parts
+
+
+def _extract_series(lines: list[str], fixture_line: str, team1: str, team2: str) -> str:
+    candidates: list[str] = []
     for line in lines:
         lower = line.lower()
         if any(lower.startswith(p) for p in ("live", "result", "today,", "tomorrow,", "match yet", "match starts")):
@@ -1033,8 +1225,12 @@ def _extract_series(lines: list[str], fixture_line: str) -> str:
             continue
         if TIME_PATTERN.search(line) or SCORE_PATTERN.search(line):
             continue
+        if STARTS_AT_PATTERN.search(line):
+            continue
         if (" tour " in lower or "tour of" in lower or re.search(r"\d{4}", line)) and len(line) > 5:
-            return line
+            candidates.append(line)
+
+    candidates.extend(_fixture_series_parts(fixture_line))
 
     if fixture_line:
         parts = [part.strip() for part in fixture_line.split(",") if part.strip()]
@@ -1043,10 +1239,16 @@ def _extract_series(lines: list[str], fixture_line: str) -> str:
                 continue
             if MATCH_LABEL_PATTERN.search(part) and len(parts) == 1:
                 continue
-            if len(part) > 5 and not _line_is_tracked_team(part):
-                return part
+            if len(part) > 5 and not _line_is_tracked_team(part) and not _looks_like_date(part):
+                candidates.append(part)
 
-    return "International Cricket"
+    if not candidates:
+        return "International Cricket"
+
+    best = max(candidates, key=lambda candidate: _series_matches_teams(candidate, team1, team2))
+    if _series_matches_teams(best, team1, team2) <= 0:
+        return "International Cricket"
+    return best
 
 
 def parse_preview_block(block: str) -> PreviewMatchInfo:
@@ -1093,7 +1295,7 @@ def parse_preview_block(block: str) -> PreviewMatchInfo:
                     date_str = f"{datetime.now():%A}, {raw}"
                 break
 
-    series = _extract_series(lines, fixture_line)
+    series = _extract_series(lines, fixture_line, teams[0], teams[1])
     day_label = _detect_day_label(block, raw_match_date)
 
     fmt = _detect_format(block)
@@ -1384,7 +1586,7 @@ def _draw_first_innings_card(info: MatchUpdateInfo) -> Image.Image:
     _paste_flag_centered(img, right_flag, UPDATE_RIGHT_X, LIVE_FLAG_Y)
 
     draw = ImageDraw.Draw(img)
-    _draw_centered_text(draw, "LIVE", UPDATE_IMAGE_WIDTH // 2, LIVE_BADGE_Y, badge_font, "#D93025")
+    _draw_centered_text(draw, _live_badge_text(info), UPDATE_IMAGE_WIDTH // 2, LIVE_BADGE_Y, badge_font, "#D93025")
     _draw_centered_text(draw, info.team1, UPDATE_LEFT_X, LIVE_NAME_Y, name_font, TEXT_PRIMARY)
     _draw_centered_text(draw, info.team2, UPDATE_RIGHT_X, LIVE_NAME_Y, name_font, TEXT_PRIMARY)
 
@@ -1437,7 +1639,7 @@ def _draw_chase_card(info: MatchUpdateInfo) -> Image.Image:
     _paste_flag_centered(img, right_flag, UPDATE_RIGHT_X, LIVE_FLAG_Y)
 
     draw = ImageDraw.Draw(img)
-    _draw_centered_text(draw, "LIVE", UPDATE_IMAGE_WIDTH // 2, LIVE_BADGE_Y, badge_font, "#D93025")
+    _draw_centered_text(draw, _live_badge_text(info), UPDATE_IMAGE_WIDTH // 2, LIVE_BADGE_Y, badge_font, "#D93025")
     _draw_centered_text(draw, info.team1, UPDATE_LEFT_X, LIVE_NAME_Y, name_font, TEXT_PRIMARY)
     _draw_centered_text(draw, info.team2, UPDATE_RIGHT_X, LIVE_NAME_Y, name_font, TEXT_PRIMARY)
 
@@ -1544,10 +1746,14 @@ def _draw_compact_update_card(info: MatchUpdateInfo) -> Image.Image:
 
 def _draw_match_update_card(info: MatchUpdateInfo) -> Image.Image:
     if info.phase == "live":
+        if info.session_break and info.score1 and info.score2:
+            return _draw_chase_card(info)
         if info.innings_status == "first_innings":
             return _draw_first_innings_card(info)
         if info.innings_status in ("chase", "innings_break"):
             return _draw_chase_card(info)
+        if info.session_break:
+            return _draw_first_innings_card(info)
     return _draw_compact_update_card(info)
 
 

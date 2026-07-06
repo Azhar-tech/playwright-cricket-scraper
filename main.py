@@ -102,6 +102,7 @@ from playing_xi import (
     build_playing_xi_info,
     generate_playing_xi_image,
     make_playing_xi_key,
+    match_playing_xi_urls,
     parse_playing_xi_from_html,
 )
 from post_builder import build_match_post
@@ -162,7 +163,7 @@ TRACKED_TEAMS = [
 
 
 
-FORMAT_INTERVALS = {"T20": 1800, "ODI": 3600, "TEST": 10800}
+FORMAT_INTERVALS = {"T20": 1800, "ODI": 3600, "TEST": 1800}
 POST_INTERVAL = 1800  # 30 minutes between scrape cycles
 INTER_MATCH_POST_DELAY = 60  # 1 minute between posts in the same cycle
 FACEBOOK_BG_CHAR_LIMIT = 130
@@ -291,6 +292,7 @@ class PostState:
     toss_posted: set[str] = field(default_factory=set)
     innings_break_posted: set[str] = field(default_factory=set)
     playing_xi_posted: set[str] = field(default_factory=set)
+    test_session_posted: set[str] = field(default_factory=set)
     live_last: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
@@ -322,6 +324,7 @@ def load_post_state() -> PostState:
             state.toss_posted = set(data.get("toss_posted", []))
             state.innings_break_posted = set(data.get("innings_break_posted", []))
             state.playing_xi_posted = set(data.get("playing_xi_posted", []))
+            state.test_session_posted = set(data.get("test_session_posted", []))
             state.live_last = dict(data.get("live_last", {}))
             return state
         except (json.JSONDecodeError, OSError, TypeError):
@@ -346,6 +349,7 @@ def save_post_state(state: PostState) -> None:
             "toss_posted": sorted(state.toss_posted),
             "innings_break_posted": sorted(state.innings_break_posted),
             "playing_xi_posted": sorted(state.playing_xi_posted),
+            "test_session_posted": sorted(state.test_session_posted),
             "live_last": state.live_last,
         }
         POST_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -722,9 +726,16 @@ async def extract_espn_match_links(page: Page) -> dict[str, str]:
             () => {
               const results = [];
               const seen = new Set();
-              for (const a of document.querySelectorAll('a[href*="/game/"], a[href*="/full-scorecard"]')) {
+              const seriesMatch = /\\/series\\/[^/]+\\/[^/]+-\\d+/i;
+              for (const a of document.querySelectorAll('a[href]')) {
                 const href = a.href;
                 if (!href || seen.has(href)) continue;
+                const isMatchLink =
+                  href.includes('/game/') ||
+                  href.includes('/full-scorecard') ||
+                  href.includes('/match-playing-xi') ||
+                  seriesMatch.test(href);
+                if (!isMatchLink) continue;
                 seen.add(href);
                 let el = a.closest('article, li, section, div');
                 for (let i = 0; i < 4 && el; i++) {
@@ -749,6 +760,8 @@ async def extract_espn_match_links(page: Page) -> dict[str, str]:
         text = str(entry.get("text", "")).strip()
         if not href or not text or not block_has_tracked_team(text):
             continue
+        href = re.sub(r"/match-playing-xi/?$", "", href, flags=re.IGNORECASE)
+        href = re.sub(r"/full-scorecard/?$", "", href, flags=re.IGNORECASE)
         key = make_match_key(text)
         if key not in links:
             links[key] = href
@@ -764,24 +777,31 @@ async def fetch_playing_xi(
     if not match_url:
         return {}
 
-    try:
-        await page.goto(match_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-        await page.wait_for_load_state("networkidle", timeout=WIDGET_WAIT_TIMEOUT_MS)
-    except PlaywrightTimeoutError:
-        logger.warning("Match page load timed out for Playing XI: %s", match_url)
+    for url in match_playing_xi_urls(match_url):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+            await page.wait_for_load_state("networkidle", timeout=WIDGET_WAIT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            logger.warning("Playing XI page load timed out: %s", url)
+            continue
 
-    await _dismiss_cookie_banner(page)
-    await asyncio.sleep(random.uniform(1.5, 3.0))
+        await _dismiss_cookie_banner(page)
+        await asyncio.sleep(random.uniform(1.5, 3.0))
 
-    try:
-        html = await page.content()
-        body_text = await page.locator("body").inner_text(timeout=8000)
-    except PlaywrightTimeoutError:
-        logger.warning("Could not read match page content for Playing XI")
-        return {}
+        try:
+            html = await page.content()
+            body_text = await page.locator("body").inner_text(timeout=8000)
+        except PlaywrightTimeoutError:
+            logger.warning("Could not read Playing XI page content: %s", url)
+            continue
 
-    squads = parse_playing_xi_from_html(html, body_text, team1, team2)
-    return {team: players for team, players in squads.items() if len(players) >= 11}
+        squads = parse_playing_xi_from_html(html, body_text, team1, team2)
+        complete = {team: players for team, players in squads.items() if len(players) >= 11}
+        if complete:
+            logger.info("Fetched Playing XI from %s", url)
+            return complete
+
+    return {}
 
 
 def _resolve_match_url(match_key: str, match_links: dict[str, str]) -> str:
@@ -802,6 +822,62 @@ def _playing_xi_pending(match_key: str, team1: str, team2: str, state: PostState
     return False
 
 
+def _toss_announced(block: str) -> bool:
+    return bool(TOSS_PATTERN.search(block))
+
+
+async def _publish_toss_update(
+    block: str,
+    match_key: str,
+    config: dict[str, str],
+    state: PostState,
+) -> bool:
+    try:
+        update_info = parse_match_block(block, "toss")
+        if not update_info.match_key:
+            update_info.match_key = match_key
+        image_path = generate_match_image(update_info)
+        post_text = build_update_caption(update_info)
+    except Exception as exc:
+        logger.error("Toss image generation failed for %s: %s", match_key, exc)
+        post_text = build_match_post(block, phase="toss")
+        if not post_text:
+            return False
+        image_path = None
+
+    if image_path is not None:
+        published = publish_photo_to_facebook(
+            post_text,
+            image_path,
+            config["FACEBOOK_PAGE_ID"],
+            config["FACEBOOK_ACCESS_TOKEN"],
+        )
+        if published:
+            try:
+                image_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    else:
+        published = publish_to_facebook(
+            post_text,
+            config["FACEBOOK_PAGE_ID"],
+            config["FACEBOOK_ACCESS_TOKEN"],
+            use_background=True,
+        )
+
+    if not published:
+        if image_path is not None:
+            try:
+                image_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
+
+    record_post_state(block, "toss", post_text, state)
+    logger.info("Posted (toss): %s", post_text[:120])
+    return True
+
+
 async def post_playing_xi_if_ready(
     block: str,
     match_links: dict[str, str],
@@ -812,8 +888,10 @@ async def post_playing_xi_if_ready(
     posted_count: int = 0,
 ) -> int:
     match_key = make_match_key(block)
-    if match_key not in state.toss_posted:
-        return posted_count
+    if match_key not in state.toss_posted and not _toss_announced(block):
+        phase = block_match_phase(block)
+        if phase not in ("live", "result", "toss"):
+            return posted_count
 
     try:
         match_info = parse_match_block(block, "toss")
@@ -882,6 +960,86 @@ async def post_playing_xi_if_ready(
                 pass
 
     return posted_count
+
+
+async def post_missed_toss_and_playing_xi(
+    raw_data: str,
+    match_links: dict[str, str],
+    page: Page,
+    config: dict[str, str],
+    state: PostState,
+    *,
+    posted_count: int = 0,
+    xi_attempted: set[str] | None = None,
+) -> int:
+    attempted = xi_attempted if xi_attempted is not None else set()
+    blocks_by_key: dict[str, list[str]] = {}
+    for block in normalize_match_blocks(raw_data):
+        if not block_has_tracked_team(block):
+            continue
+        blocks_by_key.setdefault(make_match_key(block), []).append(block)
+
+    for match_key, blocks in blocks_by_key.items():
+        if match_key in attempted:
+            continue
+
+        toss_block = next((block for block in blocks if _toss_announced(block)), None)
+        xi_block = toss_block or blocks[0]
+        toss_done = match_key in state.toss_posted
+        toss_visible = toss_block is not None
+        team1, team2 = _teams_from_block_names(xi_block)
+        xi_pending = _playing_xi_pending(match_key, team1, team2, state)
+
+        if not toss_done and not toss_visible and not xi_pending:
+            continue
+
+        if not toss_done and toss_visible and toss_block:
+            if posted_count > 0:
+                logger.info("Waiting %ds before missed toss post", INTER_MATCH_POST_DELAY)
+                await asyncio.sleep(INTER_MATCH_POST_DELAY)
+            if await _publish_toss_update(toss_block, match_key, config, state):
+                posted_count += 1
+            elif xi_pending:
+                logger.info(
+                    "Missed toss post failed for %s; will still try Playing XI if available",
+                    match_key,
+                )
+            else:
+                continue
+
+        if toss_done or toss_visible or xi_pending:
+            attempted.add(match_key)
+            if posted_count > 0 and _playing_xi_pending(match_key, team1, team2, state):
+                logger.info("Waiting %ds before Playing XI post", INTER_MATCH_POST_DELAY)
+                await asyncio.sleep(INTER_MATCH_POST_DELAY)
+            posted_count = await post_playing_xi_if_ready(
+                xi_block,
+                match_links,
+                page,
+                config,
+                state,
+                posted_count=posted_count,
+            )
+
+    return posted_count
+
+
+def _teams_from_block_names(block: str) -> tuple[str, str]:
+    teams = sorted(
+        {_normalize_team_name(line) for line in block.splitlines() if _line_is_tracked_team(line)}
+    )
+    if len(teams) < 2:
+        return "TBD", "TBD"
+    return teams[0], teams[1]
+
+
+def _normalize_team_name(line: str) -> str:
+    for team in TRACKED_TEAMS:
+        if re.fullmatch(rf"{re.escape(team)}(\s+Women)?", line.strip(), re.IGNORECASE):
+            if "women" in line.lower():
+                return f"{team} Women"
+            return team
+    return line.strip()
 
 
 def _line_is_tracked_team(line: str) -> bool:
@@ -988,25 +1146,39 @@ def normalize_match_blocks(text: str) -> list[str]:
     return normalized
 
 
-def block_match_phase(block: str) -> str:
+def block_match_phase(block: str, state: PostState | None = None) -> str:
     """Classify block as live, result, toss, preview, tomorrow, or other."""
     lines = [line.strip() for line in block.splitlines() if line.strip()]
     first_line = lines[0] if lines else ""
     first_upper = first_line.upper()
+    match_key = make_match_key(block)
+    test_in_progress = (
+        state is not None
+        and detect_format(block) == "TEST"
+        and _test_match_in_progress(match_key, block, state)
+    )
 
     if first_upper == "RESULT" or re.search(r"\bwon by\b", block, re.IGNORECASE):
         return "result"
     if first_upper.startswith("TODAY,"):
+        if test_in_progress:
+            return "live" if SCORE_PATTERN.search(block) else "other"
         return "preview"
     if any(line.upper().startswith("TOMORROW,") for line in lines):
+        if test_in_progress:
+            return "live" if SCORE_PATTERN.search(block) else "other"
         return "tomorrow"
 
     match_date = parse_match_date_from_block(block)
     tomorrow = date.today() + timedelta(days=1)
     if match_date == tomorrow:
+        if test_in_progress:
+            return "live" if SCORE_PATTERN.search(block) else "other"
         return "tomorrow"
 
     if UPCOMING_PATTERN.search(block) or "match yet to begin" in block.lower():
+        if test_in_progress:
+            return "live" if SCORE_PATTERN.search(block) else "other"
         if match_date == date.today():
             return "preview"
         if match_date == tomorrow:
@@ -1027,27 +1199,27 @@ def block_match_phase(block: str) -> str:
     return "other"
 
 
-def is_postable_block(block: str) -> bool:
+def is_postable_block(block: str, state: PostState | None = None) -> bool:
     """Tracked national-team fixtures: live, finished, toss, or today's preview."""
     if not block_has_tracked_team(block):
         return False
     if "NOT COVERED LIVE" in block.upper():
         return False
 
-    phase = block_match_phase(block)
+    phase = block_match_phase(block, state=state)
     if phase in ("live", "result", "toss", "preview", "tomorrow"):
         return True
     return False
 
 
-def extract_all_postable_blocks(text: str) -> list[tuple[str, str]]:
+def extract_all_postable_blocks(text: str, state: PostState | None = None) -> list[tuple[str, str]]:
     """Return all postable (block, phase) pairs, deduped by match key."""
     blocks = normalize_match_blocks(text)
     by_key: dict[str, tuple[str, str]] = {}
     for block in blocks:
-        if not is_postable_block(block):
+        if not is_postable_block(block, state=state):
             continue
-        phase = block_match_phase(block)
+        phase = block_match_phase(block, state=state)
         key = make_match_key(block)
         existing = by_key.get(key)
         if existing is None or PHASE_SORT_ORDER[phase] < PHASE_SORT_ORDER[existing[1]]:
@@ -1122,11 +1294,40 @@ def make_match_key(block: str) -> str:
 
 
 def make_preview_key(block: str) -> str:
+    if detect_format(block) == "TEST":
+        return make_match_key(block)
     return f"{date.today().isoformat()}|{make_match_key(block)}"
+
+
+def make_test_session_key(match_key: str, test_day: int, session_break: str) -> str:
+    return f"{match_key}|d{test_day or 1}|{session_break}"
+
+
+def _test_match_in_progress(match_key: str, block: str, state: PostState) -> bool:
+    if match_key in state.toss_posted:
+        return True
+    if match_key in state.live_last:
+        return True
+    if any(key.startswith(f"{match_key}|d") for key in state.test_session_posted):
+        return True
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    first_upper = lines[0].upper() if lines else ""
+    if first_upper == "LIVE" and SCORE_PATTERN.search(block):
+        return True
+    if (
+        SCORE_PATTERN.search(block)
+        and not UPCOMING_PATTERN.search(block)
+        and "match yet to begin" not in block.lower()
+        and "won by" not in block.lower()
+    ):
+        return True
+    return False
 
 
 def should_post_one_shot(block: str, phase: str, state: PostState) -> bool:
     if phase in ("preview", "tomorrow"):
+        if detect_format(block) == "TEST" and _test_match_in_progress(make_match_key(block), block, state):
+            return False
         return make_preview_key(block) not in state.preview_posted
     if phase == "result":
         return make_match_key(block) not in state.result_posted
@@ -1141,8 +1342,28 @@ def should_post_live(
     state: PostState,
     *,
     innings_break: bool = False,
+    session_break: str = "",
+    test_day: int = 0,
+    fmt: str = "",
 ) -> bool:
     key = make_match_key(block)
+    match_fmt = fmt or detect_format(block)
+
+    if match_fmt == "TEST":
+        if innings_break:
+            if key in state.innings_break_posted:
+                logger.info("Innings break already posted for %s; skipping", key)
+                return False
+            return True
+        if session_break in ("lunch", "tea", "stumps"):
+            session_key = make_test_session_key(key, test_day, session_break)
+            if session_key in state.test_session_posted:
+                logger.info("Test session %s already posted; skipping", session_key)
+                return False
+            return True
+        logger.info("Test match %s — no session break (lunch/tea/stumps); skipping live post", key)
+        return False
+
     if innings_break and key in state.innings_break_posted:
         logger.info("Innings break already posted for %s; skipping", key)
         return False
@@ -1182,6 +1403,8 @@ def record_post_state(
     *,
     live_signature: str = "",
     innings_break: bool = False,
+    session_break: str = "",
+    test_day: int = 0,
 ) -> None:
     if phase in ("preview", "tomorrow"):
         state.preview_posted.add(make_preview_key(block))
@@ -1198,12 +1421,16 @@ def record_post_state(
         }
         if innings_break:
             state.innings_break_posted.add(key)
+        if session_break in ("lunch", "tea", "stumps"):
+            state.test_session_posted.add(make_test_session_key(key, test_day, session_break))
     save_post_state(state)
 
 
-
-
-def get_sleep_interval(_text: str) -> int:
+def get_sleep_interval(text: str) -> int:
+    for block in normalize_match_blocks(text):
+        if block_has_tracked_team(block) and detect_format(block) == "TEST":
+            if SCORE_PATTERN.search(block) and not UPCOMING_PATTERN.search(block):
+                return FORMAT_INTERVALS["TEST"]
     return POST_INTERVAL
 
 
@@ -1384,7 +1611,7 @@ async def run_cycle(
         if match_links:
             logger.info("Found %d ESPN match page link(s) for Playing XI", len(match_links))
 
-        candidates = extract_all_postable_blocks(raw_data)
+        candidates = extract_all_postable_blocks(raw_data, state=_post_state)
         if not candidates:
             logger.info(
                 "No live/result/toss/preview update for tracked teams; waiting %ds",
@@ -1409,6 +1636,9 @@ async def run_cycle(
             use_photo = False
             live_signature = ""
             innings_break = False
+            session_break = ""
+            test_day = 0
+            match_fmt = detect_format(block)
 
             if phase in ("preview", "tomorrow"):
                 try:
@@ -1424,11 +1654,12 @@ async def run_cycle(
             elif phase in ("result", "live", "toss"):
                 try:
                     update_info = parse_match_block(block, phase)
-                    if not update_info.match_key:
-                        update_info.match_key = match_key
+                    update_info.match_key = match_key
                     if phase == "live":
                         live_signature = make_live_signature(update_info)
                         innings_break = update_info.innings_status == "innings_break"
+                        session_break = update_info.session_break
+                        test_day = update_info.test_day
                     image_path = generate_match_image(update_info)
                     post_text = build_update_caption(update_info)
                     use_photo = True
@@ -1449,6 +1680,9 @@ async def run_cycle(
                 live_signature or post_text,
                 _post_state,
                 innings_break=innings_break,
+                session_break=session_break,
+                test_day=test_day,
+                fmt=match_fmt,
             ):
                 if image_path is not None:
                     try:
@@ -1494,6 +1728,8 @@ async def run_cycle(
                 _post_state,
                 live_signature=live_signature,
                 innings_break=innings_break,
+                session_break=session_break,
+                test_day=test_day,
             )
             posted_count += 1
             logger.info("Posted (%s): %s", phase, post_text[:120])
@@ -1509,35 +1745,28 @@ async def run_cycle(
                     posted_count=posted_count,
                 )
 
-        xi_blocks = normalize_match_blocks(raw_data)
-        for block in xi_blocks:
-            match_key = make_match_key(block)
-            if match_key in xi_attempted:
-                continue
-            if match_key not in _post_state.toss_posted:
-                continue
-            if not block_has_tracked_team(block):
-                continue
-            xi_attempted.add(match_key)
-            posted_count = await post_playing_xi_if_ready(
-                block,
-                match_links,
-                page,
-                config,
-                _post_state,
-                posted_count=posted_count,
-            )
+        posted_count = await post_missed_toss_and_playing_xi(
+            raw_data,
+            match_links,
+            page,
+            config,
+            _post_state,
+            posted_count=posted_count,
+            xi_attempted=xi_attempted,
+        )
 
         if posted_count == 0:
-            logger.info("No new posts this cycle; waiting %ds", UNTRACKED_INTERVAL)
-            return UNTRACKED_INTERVAL
+            sleep_seconds = get_sleep_interval(raw_data)
+            logger.info("No new posts this cycle; waiting %ds", sleep_seconds)
+            return sleep_seconds
 
+        sleep_seconds = get_sleep_interval(raw_data)
         logger.info(
-            "Published %d post(s); next check in %ds (30 min)",
+            "Published %d post(s); next check in %ds",
             posted_count,
-            POST_INTERVAL,
+            sleep_seconds,
         )
-        return POST_INTERVAL
+        return sleep_seconds
 
 
 

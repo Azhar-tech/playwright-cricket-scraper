@@ -21,6 +21,7 @@ from playwright_stealth import Stealth
 
 from match_image import (
     _extract_time,
+    _extract_venue_from_line,
     _load_font,
     build_live_caption,
     build_preview_caption,
@@ -37,11 +38,16 @@ from playing_xi import (
     build_playing_xi_info,
     generate_playing_xi_image,
     make_playing_xi_key,
+    match_playing_xi_urls,
     parse_playing_xi_from_match_text,
 )
+from post_builder import build_match_post, build_result_post
 from main import (
     TRACKED_TEAMS,
     PostState,
+    _playing_xi_pending,
+    _teams_from_block_names,
+    _toss_announced,
     block_match_phase,
     detect_format,
     extract_all_postable_blocks,
@@ -50,6 +56,7 @@ from main import (
     is_tracked_match,
     make_match_key,
     make_preview_key,
+    make_test_session_key,
     open_stealth_session,
     publish_to_facebook,
     scrape_match,
@@ -109,6 +116,71 @@ TOMORROW, 6:30 PM
 England
 India
 Match yet to begin
+"""
+
+SAMPLE_PREVIEW_GOOGLE_ZIM_BAN = """
+India Under-19s tour of Sri Lanka 2026
+7:30 AM
+Bangladesh tour of Zimbabwe 2026
+1st ODI · Harare, July 06, 2026
+Zimbabwe
+Bangladesh
+Match yet to begin
+Starts at 12:30 pm
+"""
+
+SAMPLE_LIVE_TEST_WITH_TOSS = """
+LIVE
+Sri Lanka tour of West Indies 2026
+2nd Test, North Sound, July 03 - 07, 2026
+West Indies
+245/3
+Sri Lanka
+West Indies won the toss and elected to bat
+"""
+
+SAMPLE_TEST_LUNCH = """
+LIVE
+Sri Lanka tour of West Indies 2026
+2nd Test, North Sound, July 03 - 07, 2026
+West Indies
+120/2 (45 ov)
+Sri Lanka
+Yet to bat
+Lunch
+"""
+
+SAMPLE_TEST_TEA = """
+LIVE
+Sri Lanka tour of West Indies 2026
+2nd Test, North Sound, July 03 - 07, 2026
+West Indies
+210/4 (68 ov)
+Sri Lanka
+Yet to bat
+Day 2
+Tea break
+"""
+
+SAMPLE_TEST_STUMPS = """
+LIVE
+Sri Lanka tour of West Indies 2026
+2nd Test, North Sound, July 03 - 07, 2026
+West Indies
+245/3 (78 ov)
+Sri Lanka
+Yet to bat
+Stumps - Day 2
+"""
+
+SAMPLE_TEST_MID_SESSION = """
+LIVE
+Sri Lanka tour of West Indies 2026
+2nd Test, North Sound, July 03 - 07, 2026
+West Indies
+200/4 (60 ov)
+Sri Lanka
+Yet to bat
 """
 
 SAMPLE_RESULT_BLOCK = """
@@ -468,7 +540,155 @@ def test_preview_timezone() -> bool:
     caption_ok = "10:30 PM" in caption and caption.startswith("Tomorrow!")
     _status("Caption uses converted time", caption_ok, caption.splitlines()[0][:90])
 
-    return extract_ok and convert_ok and caption_ok
+    zim_block = SAMPLE_PREVIEW_GOOGLE_ZIM_BAN.strip()
+    starts_ok = _extract_time(zim_block) == "12:30 PM"
+    _status("Prefer Starts at time over US-converted time", starts_ok, _extract_time(zim_block))
+
+    venue_ok = _extract_venue_from_line("1st ODI · Harare, July 06, 2026") == "Harare"
+    _status("Parse venue from middot fixture line", venue_ok)
+
+    zim_info = parse_preview_block(zim_block)
+    zim_ok = (
+        zim_info.time_str == "3:30 PM"
+        and zim_info.venue == "Harare"
+        and zim_info.match_date == date(2026, 7, 6)
+        and "Bangladesh tour of Zimbabwe 2026" in zim_info.series
+        and "Sri Lanka" not in zim_info.series
+    )
+    _status("ZIM vs BAN Google widget parsed", zim_ok, f"{zim_info.time_str}, {zim_info.venue}, {zim_info.series[:40]}")
+
+    return extract_ok and convert_ok and caption_ok and starts_ok and venue_ok and zim_ok
+
+
+def test_playing_xi_triggers() -> bool:
+    print("\n=== 3k. Toss + Playing XI catch-up triggers ===")
+    block = SAMPLE_LIVE_TEST_WITH_TOSS.strip()
+    match_key = make_match_key(block)
+    team1, team2 = _teams_from_block_names(block)
+
+    phases = extract_all_postable_blocks(block)
+    live_only = len(phases) == 1 and phases[0][1] == "live"
+    _status(
+        "Live Test with toss resolves to live phase only",
+        live_only,
+        phases[0][1] if phases else "none",
+    )
+
+    toss_visible = _toss_announced(block)
+    _status("Toss text detected inside live block", toss_visible)
+
+    state = PostState()
+    xi_pending = _playing_xi_pending(match_key, team1, team2, state)
+    _status("Playing XI pending when none posted", xi_pending, f"{team1} vs {team2}")
+
+    blocked = match_key not in state.toss_posted and not _toss_announced(SAMPLE_LIVE_BLOCK.strip())
+    allowed = not (match_key not in state.toss_posted and not _toss_announced(block))
+    _status("XI gate blocks live block without toss", blocked)
+    _status("XI gate allows live block with toss text", allowed)
+
+    base = (
+        "https://www.cricinfo.com/series/sri-lanka-in-west-indies-2026-1538292/"
+        "west-indies-vs-sri-lanka-2nd-test-1538312"
+    )
+    urls = match_playing_xi_urls(base)
+    url_ok = urls[0].endswith("/match-playing-xi") and base in urls
+    _status("Series match URL maps to match-playing-xi", url_ok, urls[0])
+
+    xi_suffix = match_playing_xi_urls(f"{base}/match-playing-xi")
+    suffix_ok = len(xi_suffix) == 1 and xi_suffix[0].endswith("/match-playing-xi")
+    _status("Already-XI URL kept as-is", suffix_ok)
+
+    return live_only and toss_visible and xi_pending and blocked and allowed and url_ok and suffix_ok
+
+
+def test_test_session_posting() -> bool:
+    print("\n=== 3l. Test match session posting ===")
+    lunch_info = parse_match_block(SAMPLE_TEST_LUNCH.strip(), "live")
+    lunch_ok = lunch_info.session_break == "lunch" and lunch_info.test_day >= 1
+    _status("Lunch break detected", lunch_ok, f"day={lunch_info.test_day}, break={lunch_info.session_break}")
+
+    tea_info = parse_match_block(SAMPLE_TEST_TEA.strip(), "live")
+    tea_ok = tea_info.session_break == "tea" and tea_info.test_day == 2
+    _status("Tea break detected", tea_ok, f"day={tea_info.test_day}, break={tea_info.session_break}")
+
+    stumps_info = parse_match_block(SAMPLE_TEST_STUMPS.strip(), "live")
+    stumps_ok = stumps_info.session_break == "stumps" and stumps_info.test_day == 2
+    _status("Stumps detected", stumps_ok, f"day={stumps_info.test_day}, break={stumps_info.session_break}")
+
+    mid_info = parse_match_block(SAMPLE_TEST_MID_SESSION.strip(), "live")
+    mid_block = SAMPLE_TEST_MID_SESSION.strip()
+    mid_sig = make_live_signature(mid_info)
+    mid_skip = not should_post_live(
+        mid_block,
+        mid_sig,
+        PostState(),
+        fmt="TEST",
+    )
+    _status("Mid-session Test update blocked", mid_skip)
+
+    state = PostState()
+    lunch_sig = make_live_signature(lunch_info)
+    allow_lunch = should_post_live(
+        SAMPLE_TEST_LUNCH.strip(),
+        lunch_sig,
+        state,
+        session_break="lunch",
+        test_day=lunch_info.test_day,
+        fmt="TEST",
+    )
+    state.test_session_posted.add(
+        make_test_session_key(make_match_key(SAMPLE_TEST_LUNCH.strip()), lunch_info.test_day, "lunch")
+    )
+    skip_lunch = not should_post_live(
+        SAMPLE_TEST_LUNCH.strip(),
+        lunch_sig,
+        state,
+        session_break="lunch",
+        test_day=lunch_info.test_day,
+        fmt="TEST",
+    )
+    _status("Lunch post allowed once", allow_lunch)
+    _status("Lunch post skipped if already posted", skip_lunch)
+
+    stumps_caption = build_live_caption(stumps_info)
+    cap_ok = "Day 2" in stumps_caption and "Stumps" in stumps_info.headline
+    _status("Stumps caption uses session headline", cap_ok, stumps_caption.splitlines()[0][:90])
+
+    progress_state = PostState()
+    progress_state.toss_posted.add(make_match_key(SAMPLE_TOMORROW_BLOCK.strip()))
+    tomorrow_phase = block_match_phase(SAMPLE_TOMORROW_BLOCK.strip(), state=progress_state)
+    suppress_ok = tomorrow_phase != "tomorrow"
+    _status("Tomorrow suppressed for in-progress Test", suppress_ok, tomorrow_phase)
+
+    preview_blocked = not should_post_one_shot(
+        SAMPLE_TOMORROW_BLOCK.strip(),
+        "tomorrow",
+        progress_state,
+    )
+    _status("Preview/tomorrow one-shot blocked in progress", preview_blocked)
+
+    test_preview_key = make_preview_key(SAMPLE_TOMORROW_BLOCK.strip())
+    t20_preview_key = make_preview_key(SAMPLE_PREVIEW_BLOCK.strip())
+    key_ok = test_preview_key == make_match_key(SAMPLE_TOMORROW_BLOCK.strip())
+    t20_key_ok = t20_preview_key.startswith(f"{date.today().isoformat()}|")
+    _status("Test preview key is once per match", key_ok, test_preview_key[:60])
+    _status("T20 preview key still daily", t20_key_ok)
+
+    return all(
+        [
+            lunch_ok,
+            tea_ok,
+            stumps_ok,
+            mid_skip,
+            allow_lunch,
+            skip_lunch,
+            cap_ok,
+            suppress_ok,
+            preview_blocked,
+            key_ok,
+            t20_key_ok,
+        ]
+    )
 
 
 def test_preview_fonts() -> bool:
@@ -867,6 +1087,8 @@ async def run(args: argparse.Namespace) -> int:
     live_flow_ok = test_live_posting_flow()
     innings_layout_ok = test_innings_layouts(keep_image=args.match_image)
     playing_xi_ok = test_playing_xi(keep_image=args.playing_xi_image)
+    playing_xi_trigger_ok = test_playing_xi_triggers()
+    test_session_ok = test_test_session_posting()
     posts_ok = test_rule_based_posts()
     gemini_input = extract_tracked_match_data(raw_data) or raw_data
     post_text = await test_gemini(gemini_input.split("\n\n---\n\n")[0])
@@ -889,6 +1111,8 @@ async def run(args: argparse.Namespace) -> int:
         and live_flow_ok
         and innings_layout_ok
         and playing_xi_ok
+        and playing_xi_trigger_ok
+        and test_session_ok
     )
     if fb_ok and multi_ok and rules_ok and preview_ok and posts_ok:
         if post_text and post_text != "rule-based":

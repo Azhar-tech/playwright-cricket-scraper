@@ -74,6 +74,19 @@ def make_playing_xi_key(match_key: str, team: str) -> str:
     return f"{match_key}|{_team_slug(team)}"
 
 
+def match_playing_xi_urls(match_url: str) -> list[str]:
+    base = match_url.rstrip("/")
+    if base.endswith("/match-playing-xi"):
+        return [base]
+    candidates = [
+        f"{base}/match-playing-xi",
+        base,
+    ]
+    if "/full-scorecard" in base:
+        candidates.insert(0, base.replace("/full-scorecard", "/match-playing-xi"))
+    return list(dict.fromkeys(candidates))
+
+
 def _parse_player_roles(raw_name: str) -> tuple[str, str]:
     match = ROLE_SUFFIX.search(raw_name)
     if not match:
