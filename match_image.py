@@ -1174,20 +1174,32 @@ def _infer_venue_from_context(series: str, team1: str, team2: str) -> str:
 
 
 def _extract_time(block: str) -> str:
+    time_str, _ = _extract_time_with_is_local(block)
+    return time_str
+
+
+def _extract_time_with_is_local(block: str) -> tuple[str, bool]:
+    """Return (time_str, is_venue_local).
+
+    is_venue_local=True only when ESPN explicitly labels the time as venue-local
+    via the "X local" suffix (e.g. "9:30 PM local").  All other formats
+    ("Starts at X", "TODAY/TOMORROW, X", bare "X") are in the browser's timezone
+    which is forced to Asia/Karachi via Playwright's timezone_id setting.
+    """
     for line in block.splitlines():
         starts_match = STARTS_AT_PATTERN.search(line)
         if starts_match:
-            return starts_match.group(1).upper()
+            return starts_match.group(1).upper(), False
 
     for line in block.splitlines():
         header_match = TODAY_TOMORROW_TIME.match(line.strip())
         if header_match:
-            return header_match.group(1).upper()
+            return header_match.group(1).upper(), False
 
     for line in block.splitlines():
         local_match = LOCAL_TIME_PATTERN.search(line)
         if local_match:
-            return local_match.group(1).upper()
+            return local_match.group(1).upper(), True
 
     lines = block.splitlines()
     for idx, line in enumerate(lines):
@@ -1195,8 +1207,8 @@ def _extract_time(block: str) -> str:
             continue
         time_match = TIME_PATTERN.search(line)
         if time_match:
-            return time_match.group(0).upper()
-    return "TBC"
+            return time_match.group(0).upper(), False
+    return "TBC", False
 
 
 def _display_timezone() -> str:
@@ -1337,7 +1349,7 @@ def parse_preview_block(block: str) -> PreviewMatchInfo:
                 venue = extracted
             break
 
-    venue_local_time = _extract_time(block)
+    raw_time, is_venue_local = _extract_time_with_is_local(block)
     raw_match_date = parse_match_date_from_block(block)
 
     if venue == "TBC" and fixture_line:
@@ -1351,7 +1363,14 @@ def parse_preview_block(block: str) -> PreviewMatchInfo:
         if inferred:
             venue = inferred
 
-    time_str, display_date = _convert_preview_time(venue_local_time, raw_match_date, venue)
+    if is_venue_local:
+        # "X local" format = ESPN venue-local time; convert to PKT via venue timezone
+        time_str, display_date = _convert_preview_time(raw_time, raw_match_date, venue)
+    else:
+        # All other formats ("Starts at X", "TODAY/TOMORROW, X", bare X) are already
+        # in the browser's timezone which Playwright forces to Asia/Karachi (PKT).
+        time_str = raw_time
+        display_date = raw_match_date
     match_date = display_date if display_date is not None else raw_match_date
     if match_date:
         date_str = match_date.strftime("%A, %d %B")

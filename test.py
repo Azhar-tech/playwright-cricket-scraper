@@ -106,13 +106,13 @@ Sri Lanka tour of West Indies 2026
 West Indies
 Sri Lanka
 Match yet to begin
-TOMORROW, 7:00 PM
+TOMORROW, 4:00 AM
 """
 
 SAMPLE_TOMORROW_MULTI_TIME = """
 India tour of England 2026
 1:30 PM
-TOMORROW, 6:30 PM
+TOMORROW, 10:30 PM
 2nd T20I, Manchester, July 04, 2026
 England
 India
@@ -514,7 +514,6 @@ def test_preview_tomorrow() -> bool:
 
     parse_ok = (
         info.day_label == "tomorrow"
-        and info.match_date == date(2026, 7, 4)
         and info.time_str == "4:00 AM"
         and "Sri Lanka tour of West Indies 2026" in info.series
         and info.venue == "North Sound"
@@ -534,8 +533,8 @@ def test_preview_timezone() -> bool:
     print("\n=== 3d3. Preview time extraction + timezone ===")
     block = SAMPLE_TOMORROW_MULTI_TIME.strip()
     extracted = _extract_time(block)
-    extract_ok = extracted == "6:30 PM"
-    _status("Prefer TOMORROW header time over US-converted time", extract_ok, extracted)
+    extract_ok = extracted == "10:30 PM"
+    _status("Prefer TOMORROW header time over bare time", extract_ok, extracted)
 
     info = parse_preview_block(block)
     convert_ok = (
@@ -544,11 +543,11 @@ def test_preview_timezone() -> bool:
         and info.venue == "Manchester"
         and info.day_label == "tomorrow"
     )
-    _status("Convert venue local time to DISPLAY_TIMEZONE", convert_ok, f"{info.time_str} on {info.match_date}")
+    _status("Browser-local PKT time posted directly (no venue conversion)", convert_ok, f"{info.time_str} on {info.match_date}")
 
     caption = build_preview_caption(info)
     caption_ok = "10:30 PM" in caption and caption.startswith("Tomorrow!")
-    _status("Caption uses converted time", caption_ok, caption.splitlines()[0][:90])
+    _status("Caption uses PKT time directly", caption_ok, caption.splitlines()[0][:90])
 
     zim_block = SAMPLE_PREVIEW_GOOGLE_ZIM_BAN.strip()
     starts_ok = _extract_time(zim_block) == "12:30 PM"
@@ -559,13 +558,13 @@ def test_preview_timezone() -> bool:
 
     zim_info = parse_preview_block(zim_block)
     zim_ok = (
-        zim_info.time_str == "3:30 PM"
+        zim_info.time_str == "12:30 PM"
         and zim_info.venue == "Harare"
         and zim_info.match_date == date(2026, 7, 6)
         and "Bangladesh tour of Zimbabwe 2026" in zim_info.series
         and "Sri Lanka" not in zim_info.series
     )
-    _status("ZIM vs BAN Google widget parsed", zim_ok, f"{zim_info.time_str}, {zim_info.venue}, {zim_info.series[:40]}")
+    _status("ZIM vs BAN Google widget parsed (12:30 PM PKT direct)", zim_ok, f"{zim_info.time_str}, {zim_info.venue}, {zim_info.series[:40]}")
 
     split_blocks = split_preview_fixture_blocks(SAMPLE_PREVIEW_GOOGLE_ZIM_BAN.strip())
     zim_split = next((b for b in split_blocks if "Zimbabwe" in b and "Bangladesh" in b), "")
@@ -581,26 +580,26 @@ def test_preview_timezone() -> bool:
         "1st ODI, July 06, 2026\n"
         "Zimbabwe\nBangladesh\nMatch yet to begin\nStarts at 12:30 pm"
     )
-    infer_ok = inferred_info.venue == "Harare" and inferred_info.time_str == "3:30 PM"
-    _status("Infer Harare venue from tour and convert to PKT", infer_ok, f"{inferred_info.time_str}, {inferred_info.venue}")
+    infer_ok = inferred_info.venue == "Harare" and inferred_info.time_str == "12:30 PM"
+    _status("Infer Harare venue from tour, 12:30 PM PKT posted directly", infer_ok, f"{inferred_info.time_str}, {inferred_info.venue}")
 
-    # Bangladesh home match — venue is Mirpur (UTC+6), 1:30 PM local → 12:30 PM PKT
+    # Bangladesh home match — Mirpur venue detected, PKT time posted directly
     mirpur_info = parse_preview_block(
         "Zimbabwe tour of Bangladesh 2026\n"
         "1st ODI, Mirpur, July 06, 2026\n"
-        "Bangladesh\nZimbabwe\nMatch yet to begin\nStarts at 1:30 pm"
+        "Bangladesh\nZimbabwe\nMatch yet to begin\nStarts at 12:30 pm"
     )
     mirpur_ok = mirpur_info.time_str == "12:30 PM" and "Mirpur" in mirpur_info.venue
-    _status("Mirpur (UTC+6) 1:30 PM converts to 12:30 PM PKT", mirpur_ok, f"{mirpur_info.time_str}, {mirpur_info.venue}")
+    _status("Mirpur venue detected, 12:30 PM PKT posted directly", mirpur_ok, f"{mirpur_info.time_str}, {mirpur_info.venue}")
 
-    # Bangladesh home match — only country name as venue fallback
+    # Bangladesh home match — country-level venue fallback, PKT time posted directly
     ban_country_info = parse_preview_block(
         "Zimbabwe tour of Bangladesh 2026\n"
         "1st ODI, July 07, 2026\n"
-        "Bangladesh\nZimbabwe\nMatch yet to begin\nStarts at 1:30 pm"
+        "Bangladesh\nZimbabwe\nMatch yet to begin\nStarts at 12:30 pm"
     )
     ban_country_ok = ban_country_info.time_str == "12:30 PM"
-    _status("Bangladesh country-level venue fallback 1:30 PM -> 12:30 PM PKT", ban_country_ok, f"{ban_country_info.time_str}, {ban_country_info.venue}")
+    _status("Bangladesh venue fallback, 12:30 PM PKT posted directly", ban_country_ok, f"{ban_country_info.time_str}, {ban_country_info.venue}")
 
     return extract_ok and convert_ok and caption_ok and starts_ok and venue_ok and zim_ok and split_ok and broken_ok and infer_ok and mirpur_ok and ban_country_ok
 

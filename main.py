@@ -467,6 +467,7 @@ async def open_stealth_session(playwright) -> tuple[Browser | None, BrowserConte
             viewport=VIEWPORT,
             user_agent=USER_AGENT,
             locale="en-US",
+            timezone_id="Asia/Karachi",
             args=STEALTH_LAUNCH_ARGS,
         )
         await context.add_init_script(WEBDRIVER_OVERRIDE_SCRIPT)
@@ -487,6 +488,8 @@ async def new_stealth_page(browser: Browser) -> tuple[Page, BrowserContext]:
         user_agent=USER_AGENT,
 
         locale="en-US",
+
+        timezone_id="Asia/Karachi",
 
     )
 
