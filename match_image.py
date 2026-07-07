@@ -292,6 +292,39 @@ LIVE_FOOTER_Y = 440
 LIVE_STATS_Y = 500
 LIVE_STATS_LINE_H = 32
 
+# ---------------------------------------------------------------------------
+# Scorecard image layout constants
+# ---------------------------------------------------------------------------
+SC_FLAG_W = 80
+SC_FLAG_H = 56
+SC_FLAG_RADIUS = 6
+SC_ACCENT_H = 6
+SC_LEFT_CX = 130
+SC_RIGHT_CX = 950
+SC_FLAG_Y = 10
+SC_ABBREV_Y = 78
+SC_HDR_LABEL_Y = 112
+SC_BATTING_INFO_Y = 140
+SC_BATTING_INFO_H = 48
+SC_COL_HDR_Y = 192
+SC_COL_HDR_H = 36
+SC_ROW_START_Y = 230
+SC_ROW_H = 64
+SC_EXTRAS_H = 48
+SC_TOTAL_H = 52
+SC_SC_FOOTER_H = 36
+SC_BOTTOM_PAD = 40
+SC_NAME_X = 22
+SC_DIS_X = 372
+SC_R_RIGHT = 882
+SC_B_RIGHT = 930
+SC_4S_RIGHT = 975
+SC_6S_RIGHT = 1025
+SC_COL_HEADER_BG = "#E8EAED"
+SC_ROW_ALT_BG = "#F8F9FA"
+SC_BATTING_INFO_BG = "#F1F3F4"
+SC_NOT_OUT_COLOR = "#1A73E8"
+
 MONTHS = {
     "january": 1,
     "february": 2,
@@ -352,6 +385,38 @@ class MatchUpdateInfo:
     bowlers: list[str] = field(default_factory=list)
     test_day: int = 0
     session_break: str = ""
+
+
+@dataclass
+class ScorecardBatter:
+    """One batter row from a completed innings scorecard."""
+
+    name: str
+    dismissal: str
+    runs: int
+    balls: int
+    fours: int
+    sixes: int
+    not_out: bool = False
+
+
+@dataclass
+class ScorecardInfo:
+    """Data for a batting scorecard post image."""
+
+    team1: str
+    team2: str
+    batting_team: str
+    score: str
+    overs: str
+    match_label: str
+    series: str
+    format_tag: str
+    batters: list[ScorecardBatter] = field(default_factory=list)
+    extras: str = ""
+    extras_runs: int = 0
+    total_runs: int = 0
+    total_detail: str = ""
 
 
 def _line_is_tracked_team(line: str) -> bool:
@@ -1491,6 +1556,48 @@ def _draw_centered_text(
     draw.text((center_x - width // 2, y), text, font=font, fill=fill)
 
 
+def _draw_right_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    right_x: int,
+    y: int,
+    font: ImageFont.ImageFont,
+    fill: str,
+) -> None:
+    """Draw text right-aligned so its right edge is at right_x."""
+    bbox = draw.textbbox((0, 0), text, font=font)
+    w = bbox[2] - bbox[0]
+    draw.text((right_x - w, y), text, font=font, fill=fill)
+
+
+def _draw_score_fitted(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    center_x: int,
+    y: int,
+    fill: str,
+    max_half_width: int,
+    max_size: int = 56,
+) -> None:
+    """Draw a score centered at center_x, shrinking font until it fits.
+
+    Tries font sizes from max_size down; picks the largest whose half-width
+    does not exceed max_half_width (so the text stays within image bounds).
+    """
+    for size in (max_size, 46, 38, 32, 28, 24, 20):
+        font = _load_font(size, bold=True)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        half_w = (bbox[2] - bbox[0]) // 2
+        if half_w <= max_half_width:
+            draw.text((center_x - half_w, y), text, font=font, fill=fill)
+            return
+    # Fallback: draw at smallest size regardless
+    font = _load_font(20, bold=True)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    half_w = (bbox[2] - bbox[0]) // 2
+    draw.text((center_x - half_w, y), text, font=font, fill=fill)
+
+
 def _parse_compact_date(date_str: str) -> str | None:
     cleaned = re.sub(
         r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*,?\s*",
@@ -1705,12 +1812,12 @@ def _draw_first_innings_card(info: MatchUpdateInfo) -> Image.Image:
     _draw_centered_text(draw, info.team2, UPDATE_RIGHT_X, LIVE_NAME_Y, name_font, TEXT_PRIMARY)
 
     if info.batting_team == info.team1:
-        _draw_centered_text(draw, info.score1 or "—", UPDATE_LEFT_X, LIVE_SCORE_Y, score_font, TEXT_PRIMARY)
+        _draw_score_fitted(draw, info.score1 or "\u2014", UPDATE_LEFT_X, LIVE_SCORE_Y, TEXT_PRIMARY, UPDATE_LEFT_X)
         if info.overs1:
             _draw_centered_text(draw, info.overs1, UPDATE_LEFT_X, LIVE_OVERS_Y, overs_font, TEXT_MUTED)
         _draw_centered_text(draw, "Yet to Bat", UPDATE_RIGHT_X, LIVE_SCORE_Y + 10, mid_font, TEXT_MUTED)
     else:
-        _draw_centered_text(draw, info.score2 or "—", UPDATE_RIGHT_X, LIVE_SCORE_Y, score_font, TEXT_PRIMARY)
+        _draw_score_fitted(draw, info.score2 or "\u2014", UPDATE_RIGHT_X, LIVE_SCORE_Y, TEXT_PRIMARY, UPDATE_IMAGE_WIDTH - UPDATE_RIGHT_X)
         if info.overs2:
             _draw_centered_text(draw, info.overs2, UPDATE_RIGHT_X, LIVE_OVERS_Y, overs_font, TEXT_MUTED)
         _draw_centered_text(draw, "Yet to Bat", UPDATE_LEFT_X, LIVE_SCORE_Y + 10, mid_font, TEXT_MUTED)
@@ -1757,8 +1864,8 @@ def _draw_chase_card(info: MatchUpdateInfo) -> Image.Image:
     _draw_centered_text(draw, info.team1, UPDATE_LEFT_X, LIVE_NAME_Y, name_font, TEXT_PRIMARY)
     _draw_centered_text(draw, info.team2, UPDATE_RIGHT_X, LIVE_NAME_Y, name_font, TEXT_PRIMARY)
 
-    _draw_centered_text(draw, info.score1 or "—", UPDATE_LEFT_X, LIVE_SCORE_Y, score_font, TEXT_PRIMARY)
-    _draw_centered_text(draw, info.score2 or "—", UPDATE_RIGHT_X, LIVE_SCORE_Y, score_font, TEXT_PRIMARY)
+    _draw_score_fitted(draw, info.score1 or "\u2014", UPDATE_LEFT_X, LIVE_SCORE_Y, TEXT_PRIMARY, UPDATE_LEFT_X)
+    _draw_score_fitted(draw, info.score2 or "\u2014", UPDATE_RIGHT_X, LIVE_SCORE_Y, TEXT_PRIMARY, UPDATE_IMAGE_WIDTH - UPDATE_RIGHT_X)
     if info.overs1:
         _draw_centered_text(draw, info.overs1, UPDATE_LEFT_X, LIVE_OVERS_Y, overs_font, TEXT_MUTED)
     if info.overs2:
@@ -1858,6 +1965,385 @@ def _draw_compact_update_card(info: MatchUpdateInfo) -> Image.Image:
     return img
 
 
+# ---------------------------------------------------------------------------
+# Innings scorecard parsing
+# ---------------------------------------------------------------------------
+
+_SC_STATS_TAIL = re.compile(
+    r"\s+(\d+)\s+(\d+)\s+\d+\s+(\d+)\s+(\d+)\s+[\d.]+\s*$"
+)
+_SC_DISMISSAL_KW = re.compile(
+    r"\b(c\s+(?!\d)|lbw\s+b\s|lbw\b|b\s+(?=[A-Z])|run\s+out|not\s+out|st\s+|retired\s+)",
+    re.IGNORECASE,
+)
+_SC_SKIP_LINE = re.compile(
+    r"^\d|fall\s+of\s+wickets|^batting$|^bowling$|overs?\s*\(|\bRR:",
+    re.IGNORECASE,
+)
+_SC_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z\s.\'\u2019\-()†]+$")
+
+
+def _sc_parse_batter_line(line: str) -> ScorecardBatter | None:
+    """Parse a complete batting row: name + dismissal + R B M 4s 6s SR on one line."""
+    stats = _SC_STATS_TAIL.search(line)
+    if not stats:
+        return None
+    runs = int(stats.group(1))
+    balls = int(stats.group(2))
+    fours = int(stats.group(3))
+    sixes = int(stats.group(4))
+    name_dis = line[: stats.start()].strip()
+    dis_kw = _SC_DISMISSAL_KW.search(name_dis)
+    if dis_kw:
+        name = name_dis[: dis_kw.start()].strip()
+        dismissal = name_dis[dis_kw.start() :].strip()
+    else:
+        name = name_dis
+        dismissal = ""
+    not_out = bool(re.search(r"\bnot\s+out\b", dismissal, re.IGNORECASE))
+    if not name:
+        return None
+    return ScorecardBatter(
+        name=name,
+        dismissal=dismissal,
+        runs=runs,
+        balls=balls,
+        fours=fours,
+        sixes=sixes,
+        not_out=not_out,
+    )
+
+
+def _sc_parse_name_stats(name: str, dis_stats_line: str) -> ScorecardBatter | None:
+    """Parse when player name is separate from the dismissal+stats line."""
+    stats = _SC_STATS_TAIL.search(dis_stats_line)
+    if not stats:
+        return None
+    runs = int(stats.group(1))
+    balls = int(stats.group(2))
+    fours = int(stats.group(3))
+    sixes = int(stats.group(4))
+    dismissal = dis_stats_line[: stats.start()].strip()
+    not_out = bool(re.search(r"\bnot\s+out\b", dismissal, re.IGNORECASE))
+    return ScorecardBatter(
+        name=name,
+        dismissal=dismissal,
+        runs=runs,
+        balls=balls,
+        fours=fours,
+        sixes=sixes,
+        not_out=not_out,
+    )
+
+
+def _sc_clean_player_name(raw: str) -> str:
+    """Strip keeper dagger and captain markers from a player name."""
+    clean = re.sub(r"\s*†\s*$", "", raw)
+    clean = re.sub(r"\s*\([vc]+\)\s*$", "", clean)
+    return clean.strip()
+
+
+def parse_innings_scorecard_text(
+    body_text: str,
+    batting_team: str,
+    team1: str,
+    team2: str,
+    score: str,
+    overs: str,
+    match_label: str,
+    series: str,
+    format_tag: str,
+) -> ScorecardInfo | None:
+    """Parse an ESPN Cricinfo full-scorecard body text into a ScorecardInfo.
+
+    Supports two Playwright inner_text layouts:
+      - Combined: "Name  dismissal  R B M 4s 6s SR" on a single line per batter.
+      - Split: player names listed before the BATTING header, stats rows after it.
+    """
+    # Locate the batting team's innings section
+    team_hdr = re.compile(
+        rf"\b{re.escape(batting_team)}\s*(?:Innings|\()",
+        re.IGNORECASE,
+    )
+    m = team_hdr.search(body_text)
+    if m:
+        section = body_text[m.start() :]
+    else:
+        idx = body_text.lower().find(batting_team.lower())
+        if idx < 0:
+            logger.warning("Scorecard: could not find innings section for %s", batting_team)
+            return None
+        section = body_text[idx:]
+
+    # Locate BATTING header
+    bat_hdr = re.search(r"\bBATTING\b", section, re.IGNORECASE)
+    if not bat_hdr:
+        logger.warning("Scorecard: no BATTING header found for %s", batting_team)
+        return None
+
+    pre_batting = section[: bat_hdr.start()]
+    post_batting = section[bat_hdr.end() :]
+
+    # Extract player names from the pre-BATTING section (the team's lineup list)
+    player_names: list[str] = []
+    for raw_line in pre_batting.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line or len(raw_line) < 3 or len(raw_line) > 45:
+            continue
+        if _SC_SKIP_LINE.search(raw_line):
+            continue
+        if raw_line.lower().startswith(batting_team.lower()[:6]):
+            continue
+        if _SC_NAME_RE.match(raw_line):
+            clean = _sc_clean_player_name(raw_line)
+            if clean and clean not in player_names:
+                player_names.append(clean)
+
+    # Locate Extras and Total rows
+    extras_m = re.search(r"^Extras\b", post_batting, re.IGNORECASE | re.MULTILINE)
+    total_m = re.search(r"^Total\b", post_batting, re.IGNORECASE | re.MULTILINE)
+    rows_end = extras_m.start() if extras_m else min(len(post_batting), 2500)
+    rows_text = post_batting[:rows_end]
+
+    # Strategy 1: parse complete lines (name + dismissal + stats on one line)
+    batters: list[ScorecardBatter] = []
+    for line in rows_text.splitlines():
+        line = line.strip()
+        if not line or re.match(r"^(BATTING|R\s+B\s+M)", line, re.IGNORECASE):
+            continue
+        batter = _sc_parse_batter_line(line)
+        if batter and batter.name:
+            batters.append(batter)
+
+    # Strategy 2: fallback — zip pre-BATTING names with dismissal+stats rows
+    if len(batters) < 3 and len(player_names) >= 3:
+        dis_lines: list[str] = []
+        for line in rows_text.splitlines():
+            line = line.strip()
+            if not line or re.match(r"^(BATTING|R\s+B\s+M)", line, re.IGNORECASE):
+                continue
+            if _SC_STATS_TAIL.search(line):
+                dis_lines.append(line)
+        if dis_lines and player_names:
+            batters = []
+            for name, dl in zip(player_names[:11], dis_lines[:11]):
+                b = _sc_parse_name_stats(name, dl)
+                if b:
+                    batters.append(b)
+
+    # Parse Extras
+    extras_str = ""
+    extras_runs = 0
+    if extras_m:
+        ex_line = post_batting[extras_m.start() : extras_m.start() + 200]
+        ex_detail = re.search(r"\(([^)]+)\)", ex_line)
+        ex_num = re.search(r"\)\s*(\d+)", ex_line)
+        if not ex_num:
+            ex_num = re.search(r"Extras\s+\S*\s+(\d+)", ex_line, re.IGNORECASE)
+        if ex_num:
+            extras_runs = int(ex_num.group(1))
+        extras_str = (
+            f"({ex_detail.group(1)})  {extras_runs}" if ex_detail else str(extras_runs)
+        )
+
+    # Parse Total
+    total_runs = 0
+    total_detail = ""
+    if total_m:
+        t_line = post_batting[total_m.start() : total_m.start() + 150]
+        t_num = re.search(r"Total\s+(\d+)", t_line, re.IGNORECASE)
+        if t_num:
+            total_runs = int(t_num.group(1))
+        t_ov = re.search(r"\(([^)]+(?:Ov|ov)[^)]*)\)", t_line)
+        if t_ov:
+            total_detail = f"({t_ov.group(1)})"
+    if not total_runs and score:
+        num_m = re.match(r"(\d+)", score)
+        if num_m:
+            total_runs = int(num_m.group(1))
+    if not total_detail and overs:
+        total_detail = f"({overs} ov)"
+
+    return ScorecardInfo(
+        team1=team1,
+        team2=team2,
+        batting_team=batting_team,
+        score=score,
+        overs=overs,
+        match_label=match_label,
+        series=series,
+        format_tag=format_tag,
+        batters=batters,
+        extras=extras_str,
+        extras_runs=extras_runs,
+        total_runs=total_runs,
+        total_detail=total_detail,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scorecard image drawing
+# ---------------------------------------------------------------------------
+
+
+def _draw_scorecard_card(info: ScorecardInfo) -> Image.Image:
+    """Draw a batting innings scorecard image."""
+    num_rows = min(len(info.batters), 11)
+    extras_y = SC_ROW_START_Y + num_rows * SC_ROW_H
+    total_y = extras_y + SC_EXTRAS_H
+    footer_y = total_y + SC_TOTAL_H
+    img_h = footer_y + SC_SC_FOOTER_H + SC_BOTTOM_PAD
+
+    img = Image.new("RGB", (UPDATE_IMAGE_WIDTH, img_h), BACKGROUND)
+    draw = ImageDraw.Draw(img)
+
+    # Fonts
+    abbrev_font = _load_font(28, bold=True)
+    label_font = _load_font(22)
+    batting_info_font = _load_font(26, bold=True)
+    col_hdr_font = _load_font(18)
+    name_font_bold = _load_font(24, bold=True)
+    name_font_reg = _load_font(24)
+    dis_font = _load_font(21)
+    r_font = _load_font(26, bold=True)
+    stat_font = _load_font(21)
+    extras_font = _load_font(21)
+    total_name_font = _load_font(22, bold=True)
+    total_val_font = _load_font(26, bold=True)
+    footer_font_sc = _load_font(20)
+
+    # Accent bar in the batting team's primary colour
+    primary_color, _ = _team_kit_colors(info.batting_team)
+    draw.rectangle([(0, 0), (UPDATE_IMAGE_WIDTH, SC_ACCENT_H)], fill=primary_color)
+
+    # Flags and team abbreviations
+    left_flag = _load_team_flag(info.team1, SC_FLAG_W, SC_FLAG_H, SC_FLAG_RADIUS)
+    right_flag = _load_team_flag(info.team2, SC_FLAG_W, SC_FLAG_H, SC_FLAG_RADIUS)
+    _paste_flag_centered(img, left_flag, SC_LEFT_CX, SC_FLAG_Y)
+    _paste_flag_centered(img, right_flag, SC_RIGHT_CX, SC_FLAG_Y)
+
+    draw = ImageDraw.Draw(img)
+    _draw_centered_text(draw, _team_abbrev(info.team1), SC_LEFT_CX, SC_ABBREV_Y, abbrev_font, TEXT_PRIMARY)
+    _draw_centered_text(draw, _team_abbrev(info.team2), SC_RIGHT_CX, SC_ABBREV_Y, abbrev_font, TEXT_PRIMARY)
+    vs_y = SC_FLAG_Y + (SC_FLAG_H - 22) // 2
+    _draw_centered_text(draw, "vs", UPDATE_IMAGE_WIDTH // 2, vs_y, label_font, TEXT_MUTED)
+
+    # Match label line
+    match_info = (
+        f"{info.match_label} \u00b7 {info.series[:45]}"
+        if info.series
+        else info.match_label
+    )
+    _draw_centered_text(
+        draw, match_info[:68], UPDATE_IMAGE_WIDTH // 2, SC_HDR_LABEL_Y, label_font, TEXT_SECONDARY
+    )
+
+    # Batting info zone (team + score)
+    draw.rectangle(
+        [(0, SC_BATTING_INFO_Y), (UPDATE_IMAGE_WIDTH, SC_BATTING_INFO_Y + SC_BATTING_INFO_H)],
+        fill=SC_BATTING_INFO_BG,
+    )
+    ov_part = f"  ({info.overs} ov)" if info.overs else ""
+    batting_text = f"{info.batting_team}  \u2014  {info.score}{ov_part}"
+    _draw_centered_text(
+        draw,
+        batting_text,
+        UPDATE_IMAGE_WIDTH // 2,
+        SC_BATTING_INFO_Y + (SC_BATTING_INFO_H - 26) // 2,
+        batting_info_font,
+        TEXT_PRIMARY,
+    )
+
+    # Column headers
+    draw.rectangle(
+        [(0, SC_COL_HDR_Y), (UPDATE_IMAGE_WIDTH, SC_COL_HDR_Y + SC_COL_HDR_H)],
+        fill=SC_COL_HEADER_BG,
+    )
+    col_y = SC_COL_HDR_Y + (SC_COL_HDR_H - 18) // 2
+    draw.text((SC_NAME_X + 4, col_y), "BATTER", font=col_hdr_font, fill=TEXT_MUTED)
+    draw.text((SC_DIS_X, col_y), "HOW OUT", font=col_hdr_font, fill=TEXT_MUTED)
+    _draw_right_text(draw, "R", SC_R_RIGHT, col_y, col_hdr_font, TEXT_MUTED)
+    _draw_right_text(draw, "B", SC_B_RIGHT, col_y, col_hdr_font, TEXT_MUTED)
+    _draw_right_text(draw, "4s", SC_4S_RIGHT, col_y, col_hdr_font, TEXT_MUTED)
+    _draw_right_text(draw, "6s", SC_6S_RIGHT, col_y, col_hdr_font, TEXT_MUTED)
+
+    # Batter rows
+    for i, batter in enumerate(info.batters[:11]):
+        row_y = SC_ROW_START_Y + i * SC_ROW_H
+        if i % 2 == 1:
+            draw.rectangle(
+                [(0, row_y), (UPDATE_IMAGE_WIDTH, row_y + SC_ROW_H)], fill=SC_ROW_ALT_BG
+            )
+        # Thin bottom divider
+        draw.line(
+            [(SC_NAME_X, row_y + SC_ROW_H - 1), (UPDATE_IMAGE_WIDTH - SC_NAME_X, row_y + SC_ROW_H - 1)],
+            fill="#E8EAED",
+            width=1,
+        )
+        text_y = row_y + (SC_ROW_H - 24) // 2
+        stat_y = row_y + (SC_ROW_H - 26) // 2
+        mstat_y = row_y + (SC_ROW_H - 21) // 2
+
+        # Player name
+        name_display = batter.name[:22]
+        if batter.not_out:
+            draw.text(
+                (SC_NAME_X, text_y),
+                name_display + "*",
+                font=name_font_bold,
+                fill=SC_NOT_OUT_COLOR,
+            )
+        else:
+            draw.text((SC_NAME_X, text_y), name_display, font=name_font_reg, fill=TEXT_PRIMARY)
+
+        # Dismissal text
+        dis_display = batter.dismissal[:34] if batter.dismissal else "not out"
+        draw.text((SC_DIS_X, text_y + 1), dis_display, font=dis_font, fill=TEXT_MUTED)
+
+        # Stats
+        _draw_right_text(draw, str(batter.runs), SC_R_RIGHT, stat_y, r_font, TEXT_PRIMARY)
+        _draw_right_text(draw, str(batter.balls), SC_B_RIGHT, mstat_y, stat_font, TEXT_SECONDARY)
+        _draw_right_text(draw, str(batter.fours), SC_4S_RIGHT, mstat_y, stat_font, TEXT_SECONDARY)
+        _draw_right_text(draw, str(batter.sixes), SC_6S_RIGHT, mstat_y, stat_font, TEXT_SECONDARY)
+
+    # Extras row
+    draw.line([(0, extras_y), (UPDATE_IMAGE_WIDTH, extras_y)], fill="#D0D0D0", width=1)
+    draw.rectangle(
+        [(0, extras_y + 1), (UPDATE_IMAGE_WIDTH, extras_y + SC_EXTRAS_H)],
+        fill=SC_BATTING_INFO_BG,
+    )
+    ex_text_y = extras_y + (SC_EXTRAS_H - 21) // 2
+    draw.text((SC_NAME_X, ex_text_y), "Extras", font=extras_font, fill=TEXT_MUTED)
+    if info.extras:
+        draw.text((SC_DIS_X, ex_text_y), info.extras[:42], font=extras_font, fill=TEXT_MUTED)
+    _draw_right_text(draw, str(info.extras_runs), SC_R_RIGHT, ex_text_y, extras_font, TEXT_SECONDARY)
+
+    # Total row
+    draw.line([(0, total_y), (UPDATE_IMAGE_WIDTH, total_y)], fill="#D0D0D0", width=1)
+    tot_name_y = total_y + (SC_TOTAL_H - 22) // 2
+    tot_val_y = total_y + (SC_TOTAL_H - 26) // 2
+    draw.text((SC_NAME_X, tot_name_y), "TOTAL", font=total_name_font, fill=TEXT_PRIMARY)
+    if info.total_detail:
+        draw.text((SC_DIS_X, tot_name_y), info.total_detail[:40], font=extras_font, fill=TEXT_MUTED)
+    _draw_right_text(draw, str(info.total_runs), SC_R_RIGHT, tot_val_y, total_val_font, TEXT_PRIMARY)
+
+    # Footer
+    draw.line([(0, footer_y), (UPDATE_IMAGE_WIDTH, footer_y)], fill="#E0E0E0", width=1)
+    foot_text = (
+        f"{info.match_label} \u00b7 {info.series[:52]}" if info.series else info.match_label
+    )
+    _draw_centered_text(
+        draw,
+        foot_text[:70],
+        UPDATE_IMAGE_WIDTH // 2,
+        footer_y + (SC_SC_FOOTER_H - 20) // 2,
+        footer_font_sc,
+        TEXT_MUTED,
+    )
+
+    return img
+
+
 def _draw_match_update_card(info: MatchUpdateInfo) -> Image.Image:
     if info.phase == "live":
         if info.session_break and info.score1 and info.score2:
@@ -1885,3 +2371,35 @@ def generate_preview_image(info: PreviewMatchInfo) -> Path:
     output_path = GENERATED_IMAGES_DIR / f"preview_{safe_key}.png"
     _draw_flag_card(info).save(output_path, "PNG")
     return output_path
+
+
+def generate_scorecard_image(info: ScorecardInfo) -> Path:
+    """Generate a batting scorecard image and return its path."""
+    GENERATED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r"[^\w\-]", "_", f"{info.team1}_{info.team2}_{info.batting_team}")[:80]
+    output_path = GENERATED_IMAGES_DIR / f"scorecard_{safe_key}.png"
+    _draw_scorecard_card(info).save(output_path, "PNG")
+    return output_path
+
+
+def build_scorecard_caption(info: ScorecardInfo) -> str:
+    """Build the Facebook post caption for a batting scorecard post."""
+    abbrev1 = _team_abbrev(info.team1)
+    abbrev2 = _team_abbrev(info.team2)
+    ov_part = f" ({info.overs} ov)" if info.overs else ""
+    headline = (
+        f"Innings scorecard \u2014 {info.batting_team} {info.score}{ov_part}. "
+        f"{info.match_label}, {info.series}."
+    )
+    series_tag = _hashtag_token(info.series)
+    hashtags = [
+        f"#{abbrev1}vs{abbrev2}",
+        f"#{abbrev2}vs{abbrev1}",
+        f"#{info.format_tag}",
+        f"#{series_tag}" if series_tag else "",
+        f"#Team{_hashtag_token(info.team1.replace(' Women', ''))}",
+        f"#Team{_hashtag_token(info.team2.replace(' Women', ''))}",
+        "#CricketUpdates",
+    ]
+    tags = " ".join(tag for tag in hashtags if tag)
+    return f"{headline}\n\n{tags}"

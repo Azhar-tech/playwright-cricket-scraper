@@ -26,10 +26,13 @@ from match_image import (
     build_live_caption,
     build_preview_caption,
     build_result_caption,
+    build_scorecard_caption,
     build_toss_caption,
     generate_match_image,
     generate_preview_image,
+    generate_scorecard_image,
     make_live_signature,
+    parse_innings_scorecard_text,
     parse_match_block,
     parse_preview_block,
 )
@@ -983,7 +986,37 @@ def test_innings_layouts(keep_image: bool = False) -> bool:
     sig_b = make_live_signature(parse_match_block(block_45_5.strip(), "live"))
     _status("45.0 vs 45.5 signatures differ", sig_a != sig_b)
 
-    return first_ok and chase_ok and cap_first and cap_chase and img_ok and sig_a != sig_b
+    # Test that a long multi-innings Test score does not clip outside image bounds
+    from dataclasses import fields as dc_fields
+    from match_image import MatchUpdateInfo as _MUI
+    long_score_info = _MUI(
+        team1="Sri Lanka",
+        team2="West Indies",
+        series="Sri Lanka tour of West Indies 2026",
+        match_label="2nd Test",
+        format_tag="Test",
+        phase="live",
+        score1="22 & 549/9 & 92/2",
+        score2="499",
+        innings_status="live",
+        session_break="stumps",
+        test_day=4,
+        headline="Day 4 \u2014 Stumps: SL 22 & 549/9 & 92/2, WI 499",
+        match_key="sri-lanka-west-indies|TEST|2nd Test",
+    )
+    long_score_ok = True
+    try:
+        long_path = generate_match_image(long_score_info)
+        with Image.open(long_path) as img_ls:
+            long_score_ok = img_ls.size[0] == 1080 and long_path.stat().st_size >= 5_000
+        _status("Long Test score renders without clipping", long_score_ok, str(long_path))
+        if long_score_ok and not keep_image:
+            long_path.unlink(missing_ok=True)
+    except Exception as exc:
+        _status("Long Test score renders without clipping", False, str(exc))
+        long_score_ok = False
+
+    return first_ok and chase_ok and cap_first and cap_chase and img_ok and sig_a != sig_b and long_score_ok
 
 
 def test_playing_xi(keep_image: bool = False) -> bool:
@@ -1060,6 +1093,167 @@ yet to bat"""
     ok_live = bool(live_post) and "41/1" in (live_post or "")
     _status("Build live post", ok_live, live_post or "none")
     return ok_result and ok_live
+
+
+SAMPLE_SCORECARD_COMBINED = """\
+Zimbabwe (50 ovs maximum)
+
+Brian Bennett
+Ben Curran
+Innocent Kaia
+Craig Ervine
+Sikandar Raza
+Wessly Madhevere
+Clive Madande \u2020
+Brad Evans
+Newman Nyamhuri
+Richard Ngarava (c)
+Blessing Muzarabani
+
+36.4 Ov (RR: 3.84, 184 Mins)
+Fall of wickets
+1-36 (Ben Curran, 6.4 ov), 2-36 (Brian Bennett, 6.6 ov)
+
+BATTING R B M 4s 6s SR
+Brian Bennett c Mosaddek Hossain b Taskin Ahmed 17 24 36 3 0 70.83
+Ben Curran run out (Mehidy Hasan Miraz) 18 19 33 2 0 94.73
+Innocent Kaia c Nurul Hasan b Nahid Rana 26 39 72 1 1 66.66
+Craig Ervine b Taskin Ahmed 0 1 8 0 0 0.00
+Sikandar Raza c Nurul Hasan b Nahid Rana 1 12 25 0 0 8.33
+Wessly Madhevere c Shanto b Nahid Rana 0 10 16 0 0 0.00
+Clive Madande c Mosaddek b Nahid Rana 2 7 10 0 0 28.57
+Brad Evans lbw b Nahid Rana 3 7 14 0 0 42.85
+Newman Nyamhuri c Tanzid b Mehidy Hasan Miraz 33 51 77 5 0 64.70
+Richard Ngarava b Nahid Rana 27 41 59 3 0 65.85
+Blessing Muzarabani not out 4 10 12 0 0 40.00
+Extras (lb 3, nb 1, w 6) 10
+Total 141 (36.4 Ov, RR: 3.84)
+"""
+
+SAMPLE_SCORECARD_SPLIT = """\
+Zimbabwe (50 ovs maximum)
+
+Brian Bennett
+Ben Curran
+Innocent Kaia
+Craig Ervine
+Sikandar Raza
+Wessly Madhevere
+Clive Madande \u2020
+Brad Evans
+Newman Nyamhuri
+Richard Ngarava (c)
+Blessing Muzarabani
+
+36.4 Ov (RR: 3.84)
+Fall of wickets
+1-36 (Ben Curran, 6.4 ov)
+
+BATTING R B M 4s 6s SR
+c Mosaddek Hossain b Taskin Ahmed 17 24 36 3 0 70.83
+run out (Mehidy Hasan Miraz) 18 19 33 2 0 94.73
+c Nurul Hasan b Nahid Rana 26 39 72 1 1 66.66
+b Taskin Ahmed 0 1 8 0 0 0.00
+c Nurul Hasan b Nahid Rana 1 12 25 0 0 8.33
+c Shanto b Nahid Rana 0 10 16 0 0 0.00
+c Mosaddek b Nahid Rana 2 7 10 0 0 28.57
+lbw b Nahid Rana 3 7 14 0 0 42.85
+c Tanzid b Mehidy Hasan Miraz 33 51 77 5 0 64.70
+b Nahid Rana 27 41 59 3 0 65.85
+not out 4 10 12 0 0 40.00
+Extras (lb 3, nb 1, w 6) 10
+Total 141 (36.4 Ov, RR: 3.84)
+"""
+
+
+def test_scorecard_parsing(keep_image: bool = False) -> bool:
+    print("\n=== 4c. Innings Scorecard Parsing ===")
+    all_ok = True
+
+    def _sc(label: str, cond: bool, detail: str = "") -> None:
+        nonlocal all_ok
+        _status(label, cond, detail)
+        if not cond:
+            all_ok = False
+
+    # --- Combined format (name + dismissal + stats on one line) ---
+    info_combined = parse_innings_scorecard_text(
+        body_text=SAMPLE_SCORECARD_COMBINED,
+        batting_team="Zimbabwe",
+        team1="Zimbabwe",
+        team2="Bangladesh",
+        score="141/10",
+        overs="36.4",
+        match_label="1st ODI",
+        series="Bangladesh tour of Zimbabwe 2026",
+        format_tag="ODI",
+    )
+    _sc("Parse combined format returns ScorecardInfo", info_combined is not None)
+    if info_combined:
+        _sc("Combined: 11 batters parsed", len(info_combined.batters) == 11,
+            f"got {len(info_combined.batters)}")
+        _sc("Combined: first batter name", info_combined.batters[0].name == "Brian Bennett",
+            info_combined.batters[0].name)
+        _sc("Combined: first batter runs", info_combined.batters[0].runs == 17,
+            str(info_combined.batters[0].runs))
+        _sc("Combined: first batter balls", info_combined.batters[0].balls == 24,
+            str(info_combined.batters[0].balls))
+        _sc("Combined: first batter 4s", info_combined.batters[0].fours == 3,
+            str(info_combined.batters[0].fours))
+        _sc("Combined: last batter not-out flag", info_combined.batters[10].not_out,
+            info_combined.batters[10].name)
+        _sc("Combined: extras runs", info_combined.extras_runs == 10,
+            str(info_combined.extras_runs))
+        _sc("Combined: total runs", info_combined.total_runs == 141,
+            str(info_combined.total_runs))
+        _sc("Combined: total detail has Ov", "Ov" in info_combined.total_detail or "ov" in info_combined.total_detail,
+            info_combined.total_detail)
+
+    # --- Split format (names above BATTING header, dismissal+stats rows only) ---
+    info_split = parse_innings_scorecard_text(
+        body_text=SAMPLE_SCORECARD_SPLIT,
+        batting_team="Zimbabwe",
+        team1="Zimbabwe",
+        team2="Bangladesh",
+        score="141/10",
+        overs="36.4",
+        match_label="1st ODI",
+        series="Bangladesh tour of Zimbabwe 2026",
+        format_tag="ODI",
+    )
+    _sc("Parse split format returns ScorecardInfo", info_split is not None)
+    if info_split:
+        _sc("Split: 11 batters parsed", len(info_split.batters) == 11,
+            f"got {len(info_split.batters)}")
+        _sc("Split: first batter name", info_split.batters[0].name == "Brian Bennett",
+            info_split.batters[0].name)
+        _sc("Split: last batter not-out", info_split.batters[10].not_out,
+            info_split.batters[10].name)
+        _sc("Split: extras runs", info_split.extras_runs == 10, str(info_split.extras_runs))
+        _sc("Split: total runs", info_split.total_runs == 141, str(info_split.total_runs))
+
+    # --- Caption test ---
+    if info_combined:
+        caption = build_scorecard_caption(info_combined)
+        _sc("Caption contains team names", "Zimbabwe" in caption and "Bangladesh" in caption, caption[:80])
+        _sc("Caption contains score", "141" in caption, caption[:80])
+        _sc("Caption has hashtags", "#ZIMvsBAN" in caption, caption[-100:])
+
+    # --- Image generation ---
+    if info_combined:
+        try:
+            img_path = generate_scorecard_image(info_combined)
+            img_exists = img_path.exists()
+            _sc("Scorecard image generated", img_exists, str(img_path))
+            if img_exists and not keep_image:
+                try:
+                    img_path.unlink()
+                except OSError:
+                    pass
+        except Exception as exc:
+            _sc("Scorecard image generated", False, str(exc))
+
+    return all_ok
 
 
 async def test_gemini(raw_data: str) -> str | None:
@@ -1149,6 +1343,7 @@ async def run(args: argparse.Namespace) -> int:
     playing_xi_ok = test_playing_xi(keep_image=args.playing_xi_image)
     playing_xi_trigger_ok = test_playing_xi_triggers()
     test_session_ok = test_test_session_posting()
+    scorecard_ok = test_scorecard_parsing(keep_image=args.match_image)
     posts_ok = test_rule_based_posts()
     gemini_input = extract_tracked_match_data(raw_data) or raw_data
     post_text = await test_gemini(gemini_input.split("\n\n---\n\n")[0])
@@ -1173,6 +1368,7 @@ async def run(args: argparse.Namespace) -> int:
         and playing_xi_ok
         and playing_xi_trigger_ok
         and test_session_ok
+        and scorecard_ok
     )
     if fb_ok and multi_ok and rules_ok and preview_ok and posts_ok:
         if post_text and post_text != "rule-based":

@@ -87,11 +87,16 @@ from playwright.async_api import (
 from playwright_stealth import Stealth
 
 from match_image import (
+    MatchUpdateInfo,
+    ScorecardInfo,
     build_preview_caption,
+    build_scorecard_caption,
     build_update_caption,
     generate_match_image,
     generate_preview_image,
+    generate_scorecard_image,
     make_live_signature,
+    parse_innings_scorecard_text,
     parse_match_block,
     parse_match_date_from_block,
     parse_preview_block,
@@ -293,6 +298,7 @@ class PostState:
     innings_break_posted: set[str] = field(default_factory=set)
     playing_xi_posted: set[str] = field(default_factory=set)
     test_session_posted: set[str] = field(default_factory=set)
+    scorecard_innings_posted: set[str] = field(default_factory=set)
     live_last: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
@@ -325,6 +331,7 @@ def load_post_state() -> PostState:
             state.innings_break_posted = set(data.get("innings_break_posted", []))
             state.playing_xi_posted = set(data.get("playing_xi_posted", []))
             state.test_session_posted = set(data.get("test_session_posted", []))
+            state.scorecard_innings_posted = set(data.get("scorecard_innings_posted", []))
             state.live_last = dict(data.get("live_last", {}))
             return state
         except (json.JSONDecodeError, OSError, TypeError):
@@ -350,6 +357,7 @@ def save_post_state(state: PostState) -> None:
             "innings_break_posted": sorted(state.innings_break_posted),
             "playing_xi_posted": sorted(state.playing_xi_posted),
             "test_session_posted": sorted(state.test_session_posted),
+            "scorecard_innings_posted": sorted(state.scorecard_innings_posted),
             "live_last": state.live_last,
         }
         POST_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -805,6 +813,49 @@ async def fetch_playing_xi(
             return complete
 
     return {}
+
+
+async def fetch_innings_scorecard(
+    page: Page,
+    match_url: str,
+    info: MatchUpdateInfo,
+) -> ScorecardInfo | None:
+    """Navigate to the ESPN full-scorecard page and parse the completed innings."""
+    if not match_url:
+        return None
+
+    sc_url = match_url.rstrip("/") + "/full-scorecard"
+    try:
+        await page.goto(sc_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+        await page.wait_for_load_state("networkidle", timeout=WIDGET_WAIT_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        logger.warning("Scorecard page load timed out: %s", sc_url)
+        return None
+
+    await _dismiss_cookie_banner(page)
+    await asyncio.sleep(random.uniform(1.5, 3.0))
+
+    try:
+        body_text = await page.locator("body").inner_text(timeout=10000)
+    except PlaywrightTimeoutError:
+        logger.warning("Could not read scorecard page body: %s", sc_url)
+        return None
+
+    score = info.score1 if info.batting_team == info.team1 else info.score2
+    overs_raw = info.overs1 if info.batting_team == info.team1 else info.overs2
+    overs = overs_raw.strip("()") if overs_raw else ""
+
+    return parse_innings_scorecard_text(
+        body_text=body_text,
+        batting_team=info.batting_team,
+        team1=info.team1,
+        team2=info.team2,
+        score=score,
+        overs=overs,
+        match_label=info.match_label,
+        series=info.series,
+        format_tag=info.format_tag,
+    )
 
 
 def _resolve_match_url(match_key: str, match_links: dict[str, str]) -> str:
@@ -1758,6 +1809,47 @@ async def run_cycle(
                     _post_state,
                     posted_count=posted_count,
                 )
+
+            if phase == "live" and innings_break and match_fmt in ("T20", "ODI"):
+                sc_key = f"{match_key}|{update_info.batting_team}"
+                if sc_key not in _post_state.scorecard_innings_posted:
+                    match_url = _resolve_match_url(match_key, match_links)
+                    if match_url:
+                        try:
+                            sc_info = await fetch_innings_scorecard(
+                                page, match_url, update_info
+                            )
+                            if sc_info and sc_info.batters:
+                                sc_image = generate_scorecard_image(sc_info)
+                                sc_text = build_scorecard_caption(sc_info)
+                                await asyncio.sleep(INTER_MATCH_POST_DELAY)
+                                sc_published = publish_photo_to_facebook(
+                                    sc_text,
+                                    sc_image,
+                                    config["FACEBOOK_PAGE_ID"],
+                                    config["FACEBOOK_ACCESS_TOKEN"],
+                                )
+                                if sc_published:
+                                    try:
+                                        sc_image.unlink(missing_ok=True)
+                                    except OSError:
+                                        pass
+                                    _post_state.scorecard_innings_posted.add(sc_key)
+                                    save_post_state(_post_state)
+                                    posted_count += 1
+                                    logger.info("Posted innings scorecard for %s", sc_key)
+                                else:
+                                    logger.warning(
+                                        "Scorecard post failed (Facebook error) for %s", sc_key
+                                    )
+                            else:
+                                logger.warning(
+                                    "Scorecard parse returned no batters for %s", sc_key
+                                )
+                        except Exception as exc:
+                            logger.error(
+                                "Scorecard post error for %s: %s", sc_key, exc
+                            )
 
         posted_count = await post_missed_toss_and_playing_xi(
             raw_data,
