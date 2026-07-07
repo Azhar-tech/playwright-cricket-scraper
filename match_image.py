@@ -185,7 +185,11 @@ FORMAT_PATTERN = re.compile(r"\b(T20I?|ODI|One\s*Day|Test)\b", re.IGNORECASE)
 SCORE_PATTERN = re.compile(r"\d+/\d+")
 CRICKET_IRELAND_ORG = re.compile(r"cricket\s+ireland", re.IGNORECASE)
 TOSS_PATTERN = re.compile(
-    r"((?:[\w\s]+)\s+won the toss|(?:[\w\s-]+)\s+(?:chose|opted|elected) to (?:bat|field|bowl)[^.]*)",
+    r"([\w ]+ won the toss[^.\n]*|[\w -]+ (?:chose|opted|elected) to (?:bat|field|bowl)[^.\n]*)",
+    re.IGNORECASE,
+)
+_TOSS_ABBREV = re.compile(
+    r"^([\w ]+?)\s+(?:chose|opted|elected)\s+to\s+(bat|field|bowl)\b",
     re.IGNORECASE,
 )
 OVERS_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*/\s*(\d+)\s*ov", re.IGNORECASE)
@@ -888,6 +892,23 @@ def _match_hashtags(info: MatchUpdateInfo | PreviewMatchInfo) -> str:
     return " ".join(tag for tag in hashtags if tag)
 
 
+def _normalize_toss_text(text: str) -> str:
+    """Convert abbreviated ESPN toss text to a full readable sentence.
+
+    "Bangladesh chose to field" → "Bangladesh won the toss and elected to field"
+    "England won the toss and elected to bat" → unchanged
+    """
+    if "won the toss" in text.lower():
+        return text
+    m = _TOSS_ABBREV.match(text)
+    if m:
+        team = m.group(1).strip()
+        decision = m.group(2).lower()
+        action = "bat" if decision == "bat" else "field"
+        return f"{team} won the toss and elected to {action}"
+    return text
+
+
 def parse_match_block(block: str, phase: str) -> MatchUpdateInfo:
     lines = [line.strip() for line in block.splitlines() if line.strip()]
     teams = _teams_from_block(block)
@@ -927,7 +948,8 @@ def parse_match_block(block: str, phase: str) -> MatchUpdateInfo:
     elif phase == "toss":
         toss_match = TOSS_PATTERN.search(block)
         if toss_match:
-            info.headline = toss_match.group(1).strip().rstrip(".")
+            raw = toss_match.group(1).strip().rstrip(".")
+            info.headline = _normalize_toss_text(raw)
     elif phase == "live":
         _populate_live_context(info, block)
 

@@ -824,6 +824,22 @@ def test_match_image_generation(keep_image: bool = False) -> bool:
     toss_ok = "won the toss" in build_toss_caption(toss_info).lower()
     _status("Toss caption built", toss_ok)
 
+    # Abbreviated ESPN toss text ("chose to field") normalised to full sentence
+    abbrev_block = (
+        "Bangladesh tour of Zimbabwe 2026\n"
+        "1st ODI, Harare, July 07, 2026\n"
+        "Zimbabwe\n0\nBangladesh\nBangladesh chose to field"
+    )
+    abbrev_info = parse_match_block(abbrev_block, "toss")
+    abbrev_ok = (
+        abbrev_info.headline == "Bangladesh won the toss and elected to field"
+    )
+    _status("Abbreviated toss normalised to full sentence", abbrev_ok, abbrev_info.headline)
+
+    # Multi-line score before toss text must NOT bleed into headline
+    multiline_ok = "0" not in abbrev_info.headline and "\n" not in abbrev_info.headline
+    _status("Toss headline is single clean line (no score bleed)", multiline_ok, repr(abbrev_info.headline))
+
     parse_ok = (
         result_info.score1 == "169/5"
         and result_info.score2 == "129/8"
@@ -831,7 +847,7 @@ def test_match_image_generation(keep_image: bool = False) -> bool:
     )
     _status("Result scores parsed", parse_ok, f"{result_info.score1} / {result_info.score2}")
 
-    return all_ok and caption_ok and toss_ok and parse_ok
+    return all_ok and caption_ok and toss_ok and abbrev_ok and multiline_ok and parse_ok
 
 
 def test_live_posting_flow() -> bool:
