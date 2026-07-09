@@ -76,6 +76,8 @@ def make_playing_xi_key(match_key: str, team: str) -> str:
 
 def match_playing_xi_urls(match_url: str) -> list[str]:
     base = match_url.rstrip("/")
+    # Strip known ESPN page-specific suffixes so we always start from the base match URL
+    base = re.sub(r"/live-cricket-score$", "", base, flags=re.IGNORECASE)
     if base.endswith("/match-playing-xi"):
         return [base]
     candidates = [

@@ -773,6 +773,7 @@ async def extract_espn_match_links(page: Page) -> dict[str, str]:
             continue
         href = re.sub(r"/match-playing-xi/?$", "", href, flags=re.IGNORECASE)
         href = re.sub(r"/full-scorecard/?$", "", href, flags=re.IGNORECASE)
+        href = re.sub(r"/live-cricket-score/?$", "", href, flags=re.IGNORECASE)
         key = make_match_key(text)
         if key not in links:
             links[key] = href

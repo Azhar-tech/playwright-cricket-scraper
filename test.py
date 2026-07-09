@@ -645,7 +645,24 @@ def test_playing_xi_triggers() -> bool:
     suffix_ok = len(xi_suffix) == 1 and xi_suffix[0].endswith("/match-playing-xi")
     _status("Already-XI URL kept as-is", suffix_ok)
 
-    return live_only and toss_visible and xi_pending and blocked and allowed and url_ok and suffix_ok
+    # /live-cricket-score suffix must be stripped before building candidate URLs
+    live_score_base = (
+        "https://www.espncricinfo.com/series/bangladesh-in-zimbabwe-2026-1538288/"
+        "zimbabwe-vs-bangladesh-2nd-odi-1538299/live-cricket-score"
+    )
+    live_score_urls = match_playing_xi_urls(live_score_base)
+    expected_xi = (
+        "https://www.espncricinfo.com/series/bangladesh-in-zimbabwe-2026-1538288/"
+        "zimbabwe-vs-bangladesh-2nd-odi-1538299/match-playing-xi"
+    )
+    live_score_ok = live_score_urls[0] == expected_xi
+    _status(
+        "live-cricket-score URL stripped before building XI URL",
+        live_score_ok,
+        live_score_urls[0],
+    )
+
+    return live_only and toss_visible and xi_pending and blocked and allowed and url_ok and suffix_ok and live_score_ok
 
 
 def test_test_session_posting() -> bool:
