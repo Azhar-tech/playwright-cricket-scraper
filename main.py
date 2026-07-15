@@ -198,6 +198,17 @@ NAVIGATION_TIMEOUT_MS = 30_000
 
 WIDGET_WAIT_TIMEOUT_MS = 20_000
 
+XI_NAVIGATION_TIMEOUT_MS = 45_000
+
+XI_CONTENT_WAIT_MS = 15_000
+
+PLAYING_XI_CONTENT_SELECTORS = (
+    "text=Playing XI",
+    "table",
+    "[class*='playing-xi']",
+    "[class*='PlayingXi']",
+)
+
 
 
 USER_AGENT = (
@@ -780,6 +791,41 @@ async def extract_espn_match_links(page: Page) -> dict[str, str]:
     return links
 
 
+async def _wait_for_playing_xi_content(page: Page) -> bool:
+    """Wait for Playing XI page content; ESPN often never reaches networkidle."""
+    per_selector_ms = max(3000, XI_CONTENT_WAIT_MS // len(PLAYING_XI_CONTENT_SELECTORS))
+    for selector in PLAYING_XI_CONTENT_SELECTORS:
+        try:
+            await page.locator(selector).first.wait_for(
+                state="visible",
+                timeout=per_selector_ms,
+            )
+            return True
+        except PlaywrightTimeoutError:
+            continue
+    return False
+
+
+async def _read_playing_xi_page(
+    page: Page,
+    url: str,
+    team1: str,
+    team2: str,
+) -> dict[str, list[PlayingXiPlayer]]:
+    await _dismiss_cookie_banner(page)
+    await asyncio.sleep(random.uniform(1.5, 3.0))
+
+    try:
+        html = await page.content()
+        body_text = await page.locator("body").inner_text(timeout=8000)
+    except PlaywrightTimeoutError:
+        logger.warning("Could not read Playing XI page body: %s", url)
+        return {}
+
+    squads = parse_playing_xi_from_html(html, body_text, team1, team2)
+    return {team: players for team, players in squads.items() if len(players) >= 11}
+
+
 async def fetch_playing_xi(
     page: Page,
     match_url: str,
@@ -790,28 +836,32 @@ async def fetch_playing_xi(
         return {}
 
     for url in match_playing_xi_urls(match_url):
+        nav_ok = True
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-            await page.wait_for_load_state("networkidle", timeout=WIDGET_WAIT_TIMEOUT_MS)
+            await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=XI_NAVIGATION_TIMEOUT_MS,
+            )
         except PlaywrightTimeoutError:
-            logger.warning("Playing XI page load timed out: %s", url)
-            continue
+            logger.warning("Playing XI navigation timed out: %s", url)
+            nav_ok = False
 
-        await _dismiss_cookie_banner(page)
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+        if nav_ok:
+            if not await _wait_for_playing_xi_content(page):
+                logger.info(
+                    "Playing XI content selector not found; trying partial parse: %s",
+                    url,
+                )
+        else:
+            logger.info("Trying partial Playing XI parse after navigation timeout: %s", url)
 
-        try:
-            html = await page.content()
-            body_text = await page.locator("body").inner_text(timeout=8000)
-        except PlaywrightTimeoutError:
-            logger.warning("Could not read Playing XI page content: %s", url)
-            continue
-
-        squads = parse_playing_xi_from_html(html, body_text, team1, team2)
-        complete = {team: players for team, players in squads.items() if len(players) >= 11}
+        complete = await _read_playing_xi_page(page, url, team1, team2)
         if complete:
             logger.info("Fetched Playing XI from %s", url)
             return complete
+
+        logger.info("Playing XI parsed empty from %s", url)
 
     return {}
 
@@ -968,7 +1018,7 @@ async def post_playing_xi_if_ready(
     logger.info("Fetching Playing XI from %s", match_url)
     squads = await fetch_playing_xi(page, match_url, team1, team2)
     if not squads:
-        logger.info("Playing XI not available yet for %s", match_key)
+        logger.info("Playing XI fetch returned no squads for %s", match_key)
         return posted_count
 
     for team in (team1, team2):

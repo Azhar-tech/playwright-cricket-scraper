@@ -23,6 +23,7 @@ from match_image import (
     _extract_time,
     _extract_venue_from_line,
     _load_font,
+    _parse_score_line,
     build_live_caption,
     build_preview_caption,
     build_result_caption,
@@ -224,6 +225,14 @@ England
 India
 England won the toss and elected to bat
 Match starts 7:00 PM
+"""
+
+SAMPLE_TOSS_WI_NZ_BLOCK = """
+New Zealand tour of West Indies 2026
+2nd ODI (D/N)
+West Indies
+New Zealand
+New Zealand won the toss and elected to field
 """
 
 SAMPLE_LIVE_WITH_TOSS_BLOCK = """
@@ -821,7 +830,7 @@ def test_match_image_generation(keep_image: bool = False) -> bool:
         size_ok = False
         if path.exists():
             with Image.open(path) as img:
-                expected_h = 900 if phase == "live" else 720
+                expected_h = 900 if phase in ("live", "toss") else 720
                 size_ok = img.size == (1080, expected_h)
 
         ok = path.exists() and path.stat().st_size >= 10_000 and size_ok
@@ -868,6 +877,57 @@ def test_match_image_generation(keep_image: bool = False) -> bool:
     _status("Result scores parsed", parse_ok, f"{result_info.score1} / {result_info.score2}")
 
     return all_ok and caption_ok and toss_ok and abbrev_ok and multiline_ok and parse_ok
+
+
+def test_toss_card_colors() -> bool:
+    print("\n=== 3g2. Toss card per-team colors ===")
+    from PIL import Image
+
+    from match_image import generate_match_image, parse_match_block
+
+    cases = [
+        ("eng_ind", SAMPLE_TOSS_BLOCK.strip()),
+        ("wi_nz", SAMPLE_TOSS_WI_NZ_BLOCK.strip()),
+    ]
+    pixels: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {}
+    all_ok = True
+
+    for key, block in cases:
+        try:
+            info = parse_match_block(block, "toss")
+            path = generate_match_image(info)
+        except Exception as exc:
+            _status(f"Generate toss colors ({key})", False, str(exc))
+            all_ok = False
+            continue
+
+        ok = False
+        if path.exists() and path.stat().st_size >= 10_000:
+            with Image.open(path) as img:
+                if img.size == (1080, 900):
+                    left_px = img.getpixel((50, 450))
+                    right_px = img.getpixel((1030, 450))
+                    pixels[key] = (left_px, right_px)
+                    ok = True
+        _status(f"Generate toss colors ({key})", ok, str(path))
+        if not ok:
+            all_ok = False
+        else:
+            path.unlink(missing_ok=True)
+
+    diff_ok = False
+    if "eng_ind" in pixels and "wi_nz" in pixels:
+        eng_left, eng_right = pixels["eng_ind"]
+        wi_left, wi_right = pixels["wi_nz"]
+        diff_ok = eng_left != wi_left or eng_right != wi_right
+    _status(
+        "Toss background differs between matchups",
+        diff_ok,
+        f"ENG/IND left={pixels.get('eng_ind', ('?', '?'))[0]} "
+        f"WI/NZ left={pixels.get('wi_nz', ('?', '?'))[0]}",
+    )
+
+    return all_ok and diff_ok
 
 
 def test_live_posting_flow() -> bool:
@@ -944,6 +1004,23 @@ def test_live_posting_flow() -> bool:
             "146" in chase_caption,
         ]
     )
+
+
+def test_odi_overs_score_parsing() -> bool:
+    print("\n=== 3h2. ODI overs/score parsing ===")
+    score_a, overs_a = _parse_score_line("50/5 (47.5/50 ov)")
+    ok_a = score_a == "50/5" and overs_a == "(47.5)"
+    _status("50/5 not confused with 5/50 from overs", ok_a, f"{score_a} {overs_a}")
+
+    score_b, overs_b = _parse_score_line("136/3 (36/50 ov)")
+    ok_b = score_b == "136/3" and overs_b == "(36)"
+    _status("136/3 not confused with 36/50 from overs", ok_b, f"{score_b} {overs_b}")
+
+    score_c, overs_c = _parse_score_line("50/5 (47.5 ov)")
+    ok_c = score_c == "50/5" and overs_c == "(47.5)"
+    _status("Simple overs format still parses", ok_c, f"{score_c} {overs_c}")
+
+    return ok_a and ok_b and ok_c
 
 
 def test_innings_layouts(keep_image: bool = False) -> bool:
@@ -1355,7 +1432,9 @@ async def run(args: argparse.Namespace) -> int:
     font_ok = test_preview_fonts()
     image_ok = test_preview_image_generation(keep_image=args.preview_image)
     match_image_ok = test_match_image_generation(keep_image=args.match_image)
+    toss_colors_ok = test_toss_card_colors()
     live_flow_ok = test_live_posting_flow()
+    score_parse_ok = test_odi_overs_score_parsing()
     innings_layout_ok = test_innings_layouts(keep_image=args.match_image)
     playing_xi_ok = test_playing_xi(keep_image=args.playing_xi_image)
     playing_xi_trigger_ok = test_playing_xi_triggers()
@@ -1380,7 +1459,9 @@ async def run(args: argparse.Namespace) -> int:
         and font_ok
         and image_ok
         and match_image_ok
+        and toss_colors_ok
         and live_flow_ok
+        and score_parse_ok
         and innings_layout_ok
         and playing_xi_ok
         and playing_xi_trigger_ok

@@ -293,6 +293,24 @@ LIVE_STATS_Y = 500
 LIVE_STATS_LINE_H = 32
 
 # ---------------------------------------------------------------------------
+# Toss card layout constants
+# ---------------------------------------------------------------------------
+TOSS_IMAGE_HEIGHT = 900
+TOSS_BASE_BG = "#F5F7FA"
+TOSS_WASH_ALPHA = 0.25
+TOSS_FLAG_W = 140
+TOSS_FLAG_H = 98
+TOSS_FLAG_FRAME_RADIUS = 14
+TOSS_FLAG_FRAME_PAD = 8
+TOSS_FLAG_Y = 100
+TOSS_NAME_Y = 220
+TOSS_BADGE_Y = 36
+TOSS_HEADLINE_Y = 340
+TOSS_HEADLINE_PANEL_W = 900
+TOSS_HEADLINE_PANEL_H = 120
+TOSS_FOOTER_Y = 820
+
+# ---------------------------------------------------------------------------
 # Scorecard image layout constants
 # ---------------------------------------------------------------------------
 SC_FLAG_W = 80
@@ -519,14 +537,16 @@ def _parse_score_line(line: str, *, innings_complete: bool = False) -> tuple[str
     overs_match = OVERS_PATTERN.search(line)
     simple_overs = SIMPLE_OVERS_PATTERN.search(line)
     target_match = TARGET_PATTERN.search(line)
-    scores = SCORE_PATTERN.findall(line)
+    # Mask overs fractions (e.g. 47.5/50 ov) so they are not mistaken for scores
+    masked = OVERS_PATTERN.sub(" ", line)
+    scores = SCORE_PATTERN.findall(masked)
 
     if "&" in line:
         parts = re.findall(r"\d+(?:/\d+)?", line)
         if parts:
             return " & ".join(parts[:3]), ""
 
-    score = scores[-1] if scores else ""
+    score = scores[0] if scores else ""
     if not score and re.fullmatch(r"\d+", line):
         score = line
 
@@ -545,7 +565,7 @@ def _parse_score_line(line: str, *, innings_complete: bool = False) -> tuple[str
         overs_display = f"({simple_overs.group(1)})"
 
     if target_match and not score and scores:
-        score = scores[-1]
+        score = scores[0]
 
     return score, overs_display
 
@@ -1543,6 +1563,70 @@ def _hex_rgb(hex_color: str) -> tuple[int, int, int]:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
+def _interpolate_color(
+    c1: tuple[int, int, int], c2: tuple[int, int, int], t: float
+) -> tuple[int, int, int]:
+    t = max(0.0, min(1.0, t))
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))  # type: ignore[return-value]
+
+
+def _draw_toss_background(width: int, height: int, team1: str, team2: str) -> Image.Image:
+    """Light base with left/right team-color washes from TEAM_KITS."""
+    base = _hex_rgb(TOSS_BASE_BG)
+    left_c = _hex_rgb(_team_kit_colors(team1)[0])
+    right_c = _hex_rgb(_team_kit_colors(team2)[0])
+    img = Image.new("RGB", (width, height))
+    pixels = img.load()
+    half = width / 2.0
+    for x in range(width):
+        if x < half:
+            wash = max(0.0, 1.0 - x / half) * TOSS_WASH_ALPHA
+            color = _interpolate_color(base, left_c, wash)
+        else:
+            wash = max(0.0, (x - half) / half) * TOSS_WASH_ALPHA
+            color = _interpolate_color(base, right_c, wash)
+        for y in range(height):
+            pixels[x, y] = color  # type: ignore[index]
+    return img
+
+
+def _paste_flag_in_colored_frame(
+    base: Image.Image,
+    team: str,
+    center_x: int,
+    top_y: int,
+) -> None:
+    """Paste a team flag inside a rounded rectangle filled with team primary color."""
+    primary, _ = _team_kit_colors(team)
+    frame_w = TOSS_FLAG_W + TOSS_FLAG_FRAME_PAD * 2
+    frame_h = TOSS_FLAG_H + TOSS_FLAG_FRAME_PAD * 2
+    frame_left = center_x - frame_w // 2
+    draw = ImageDraw.Draw(base)
+    draw.rounded_rectangle(
+        [(frame_left, top_y), (frame_left + frame_w, top_y + frame_h)],
+        radius=TOSS_FLAG_FRAME_RADIUS,
+        fill=primary,
+    )
+    inner_pad = 4
+    draw.rounded_rectangle(
+        [
+            (frame_left + inner_pad, top_y + inner_pad),
+            (frame_left + frame_w - inner_pad, top_y + frame_h - inner_pad),
+        ],
+        radius=max(TOSS_FLAG_FRAME_RADIUS - 2, 4),
+        fill="#FFFFFF",
+    )
+    flag = _load_team_flag(
+        team,
+        TOSS_FLAG_W,
+        TOSS_FLAG_H,
+        max(TOSS_FLAG_FRAME_RADIUS - 4, 4),
+    )
+    flag_x = center_x - TOSS_FLAG_W // 2
+    flag_y = top_y + TOSS_FLAG_FRAME_PAD
+    base.paste(flag, (flag_x, flag_y), flag)
+
+
 def _draw_centered_text(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -1888,6 +1972,62 @@ def _draw_chase_card(info: MatchUpdateInfo) -> Image.Image:
     return img
 
 
+def _draw_toss_card(info: MatchUpdateInfo) -> Image.Image:
+    img = _draw_toss_background(
+        UPDATE_IMAGE_WIDTH, TOSS_IMAGE_HEIGHT, info.team1, info.team2
+    )
+    _paste_flag_in_colored_frame(img, info.team1, UPDATE_LEFT_X, TOSS_FLAG_Y)
+    _paste_flag_in_colored_frame(img, info.team2, UPDATE_RIGHT_X, TOSS_FLAG_Y)
+
+    draw = ImageDraw.Draw(img)
+    badge_font = _load_font(22, bold=True)
+    name_font = _load_font(28, bold=True)
+    headline_font = _load_font(34, bold=True)
+    footer_font = _load_font(24, bold=False)
+
+    _draw_centered_text(draw, "TOSS", UPDATE_IMAGE_WIDTH // 2, TOSS_BADGE_Y, badge_font, TEXT_MUTED)
+    _draw_centered_text(draw, info.team1, UPDATE_LEFT_X, TOSS_NAME_Y, name_font, TEXT_PRIMARY)
+    _draw_centered_text(draw, info.team2, UPDATE_RIGHT_X, TOSS_NAME_Y, name_font, TEXT_PRIMARY)
+
+    if info.headline:
+        headline = info.headline
+        if len(headline) > 70:
+            headline = headline[:67] + "..."
+
+        panel_x = (UPDATE_IMAGE_WIDTH - TOSS_HEADLINE_PANEL_W) // 2
+        panel_y = TOSS_HEADLINE_Y - 20
+        overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, TOSS_IMAGE_HEIGHT), (0, 0, 0, 0))
+        panel_draw = ImageDraw.Draw(overlay)
+        panel_draw.rounded_rectangle(
+            [
+                (panel_x, panel_y),
+                (panel_x + TOSS_HEADLINE_PANEL_W, panel_y + TOSS_HEADLINE_PANEL_H),
+            ],
+            radius=12,
+            fill=(255, 255, 255, 210),
+        )
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        _draw_centered_text(
+            draw,
+            headline,
+            UPDATE_IMAGE_WIDTH // 2,
+            TOSS_HEADLINE_Y,
+            headline_font,
+            TEXT_PRIMARY,
+        )
+
+    _draw_centered_text(
+        draw,
+        _update_footer_line(info),
+        UPDATE_IMAGE_WIDTH // 2,
+        TOSS_FOOTER_Y,
+        footer_font,
+        TEXT_MUTED,
+    )
+    return img
+
+
 def _draw_compact_update_card(info: MatchUpdateInfo) -> Image.Image:
     img = Image.new("RGB", (UPDATE_IMAGE_WIDTH, UPDATE_IMAGE_HEIGHT), BACKGROUND)
     draw = ImageDraw.Draw(img)
@@ -1919,39 +2059,24 @@ def _draw_compact_update_card(info: MatchUpdateInfo) -> Image.Image:
     _draw_centered_text(draw, info.team1, UPDATE_LEFT_X, UPDATE_NAME_Y, name_font, TEXT_PRIMARY)
     _draw_centered_text(draw, info.team2, UPDATE_RIGHT_X, UPDATE_NAME_Y, name_font, TEXT_PRIMARY)
 
-    if info.phase == "toss":
-        _draw_centered_text(draw, "TOSS", UPDATE_IMAGE_WIDTH // 2, UPDATE_SCORE_Y, badge_font, TEXT_MUTED)
-        if info.headline:
-            headline = info.headline
-            if len(headline) > 70:
-                headline = headline[:67] + "..."
-            _draw_centered_text(
-                draw,
-                headline,
-                UPDATE_IMAGE_WIDTH // 2,
-                UPDATE_HEADLINE_Y,
-                headline_font,
-                TEXT_PRIMARY,
-            )
-    else:
-        score1 = info.score1 or "—"
-        score2 = info.score2 or "—"
-        _draw_centered_text(draw, score1, UPDATE_SCORE_LEFT_X, UPDATE_SCORE_Y, score_font, TEXT_PRIMARY)
-        _draw_centered_text(draw, score2, UPDATE_SCORE_RIGHT_X, UPDATE_SCORE_Y, score_font, TEXT_PRIMARY)
-        if info.overs1:
-            _draw_centered_text(draw, info.overs1, UPDATE_SCORE_LEFT_X, UPDATE_OVERS_Y, overs_font, TEXT_MUTED)
-        if info.overs2:
-            _draw_centered_text(draw, info.overs2, UPDATE_SCORE_RIGHT_X, UPDATE_OVERS_Y, overs_font, TEXT_MUTED)
+    score1 = info.score1 or "—"
+    score2 = info.score2 or "—"
+    _draw_centered_text(draw, score1, UPDATE_SCORE_LEFT_X, UPDATE_SCORE_Y, score_font, TEXT_PRIMARY)
+    _draw_centered_text(draw, score2, UPDATE_SCORE_RIGHT_X, UPDATE_SCORE_Y, score_font, TEXT_PRIMARY)
+    if info.overs1:
+        _draw_centered_text(draw, info.overs1, UPDATE_SCORE_LEFT_X, UPDATE_OVERS_Y, overs_font, TEXT_MUTED)
+    if info.overs2:
+        _draw_centered_text(draw, info.overs2, UPDATE_SCORE_RIGHT_X, UPDATE_OVERS_Y, overs_font, TEXT_MUTED)
 
-        if info.headline:
-            _draw_centered_text(
-                draw,
-                info.headline,
-                UPDATE_IMAGE_WIDTH // 2,
-                UPDATE_HEADLINE_Y,
-                headline_font,
-                TEXT_PRIMARY,
-            )
+    if info.headline:
+        _draw_centered_text(
+            draw,
+            info.headline,
+            UPDATE_IMAGE_WIDTH // 2,
+            UPDATE_HEADLINE_Y,
+            headline_font,
+            TEXT_PRIMARY,
+        )
 
     _draw_centered_text(
         draw,
@@ -2345,6 +2470,8 @@ def _draw_scorecard_card(info: ScorecardInfo) -> Image.Image:
 
 
 def _draw_match_update_card(info: MatchUpdateInfo) -> Image.Image:
+    if info.phase == "toss":
+        return _draw_toss_card(info)
     if info.phase == "live":
         if info.session_break and info.score1 and info.score2:
             return _draw_chase_card(info)
