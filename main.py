@@ -171,6 +171,8 @@ TRACKED_TEAMS = [
 FORMAT_INTERVALS = {"T20": 1800, "ODI": 3600, "TEST": 1800}
 POST_INTERVAL = 1800  # 30 minutes between scrape cycles
 INTER_MATCH_POST_DELAY = 60  # 1 minute between posts in the same cycle
+PLAYING_XI_AFTER_TOSS_DELAY = 150  # seconds after toss before first XI post
+PLAYING_XI_TEAM_DELAY = 60  # seconds between team 1 and team 2 XI posts
 FACEBOOK_BG_CHAR_LIMIT = 130
 
 FACEBOOK_BG_PRESETS = [
@@ -308,8 +310,10 @@ class PostState:
     toss_posted: set[str] = field(default_factory=set)
     innings_break_posted: set[str] = field(default_factory=set)
     playing_xi_posted: set[str] = field(default_factory=set)
+    playing_xi_abandoned: set[str] = field(default_factory=set)
     test_session_posted: set[str] = field(default_factory=set)
     scorecard_innings_posted: set[str] = field(default_factory=set)
+    toss_posted_at: dict[str, str] = field(default_factory=dict)
     live_last: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
@@ -341,8 +345,10 @@ def load_post_state() -> PostState:
             state.toss_posted = set(data.get("toss_posted", []))
             state.innings_break_posted = set(data.get("innings_break_posted", []))
             state.playing_xi_posted = set(data.get("playing_xi_posted", []))
+            state.playing_xi_abandoned = set(data.get("playing_xi_abandoned", []))
             state.test_session_posted = set(data.get("test_session_posted", []))
             state.scorecard_innings_posted = set(data.get("scorecard_innings_posted", []))
+            state.toss_posted_at = dict(data.get("toss_posted_at", {}))
             state.live_last = dict(data.get("live_last", {}))
             return state
         except (json.JSONDecodeError, OSError, TypeError):
@@ -367,8 +373,10 @@ def save_post_state(state: PostState) -> None:
             "toss_posted": sorted(state.toss_posted),
             "innings_break_posted": sorted(state.innings_break_posted),
             "playing_xi_posted": sorted(state.playing_xi_posted),
+            "playing_xi_abandoned": sorted(state.playing_xi_abandoned),
             "test_session_posted": sorted(state.test_session_posted),
             "scorecard_innings_posted": sorted(state.scorecard_innings_posted),
+            "toss_posted_at": state.toss_posted_at,
             "live_last": state.live_last,
         }
         POST_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -927,6 +935,60 @@ def _playing_xi_pending(match_key: str, team1: str, team2: str, state: PostState
     return False
 
 
+def _match_underway(block: str, state: PostState) -> bool:
+    match_key = make_match_key(block)
+    if match_key in state.live_last:
+        return True
+    phase = block_match_phase(block, state=state)
+    return phase in ("live", "result")
+
+
+def _abandon_playing_xi(match_key: str, state: PostState) -> None:
+    if match_key in state.playing_xi_abandoned:
+        return
+    state.playing_xi_abandoned.add(match_key)
+    save_post_state(state)
+    logger.info("Playing XI abandoned for %s — match already underway", match_key)
+
+
+def _playing_xi_allowed(match_key: str, block: str, state: PostState) -> bool:
+    if match_key in state.playing_xi_abandoned:
+        logger.info("Playing XI skipped for %s — abandoned", match_key)
+        return False
+    if _match_underway(block, state):
+        _abandon_playing_xi(match_key, state)
+        logger.info("Playing XI skipped for %s — match underway", match_key)
+        return False
+    if match_key not in state.toss_posted:
+        logger.info("Playing XI skipped for %s — toss not posted yet", match_key)
+        return False
+    posted_at = state.toss_posted_at.get(match_key)
+    if posted_at:
+        try:
+            elapsed = (datetime.now() - datetime.fromisoformat(posted_at)).total_seconds()
+            if elapsed < PLAYING_XI_AFTER_TOSS_DELAY:
+                remaining = int(PLAYING_XI_AFTER_TOSS_DELAY - elapsed)
+                logger.info(
+                    "Playing XI skipped for %s — waiting %ds after toss",
+                    match_key,
+                    remaining,
+                )
+                return False
+        except ValueError:
+            pass
+    return True
+
+
+def _best_block_for_playing_xi(blocks: list[str], state: PostState) -> str | None:
+    for block in blocks:
+        if block_match_phase(block, state=state) == "toss":
+            return block
+    for block in blocks:
+        if _toss_announced(block) and not _match_underway(block, state):
+            return block
+    return None
+
+
 def _toss_announced(block: str) -> bool:
     return bool(TOSS_PATTERN.search(block))
 
@@ -993,10 +1055,8 @@ async def post_playing_xi_if_ready(
     posted_count: int = 0,
 ) -> int:
     match_key = make_match_key(block)
-    if match_key not in state.toss_posted and not _toss_announced(block):
-        phase = block_match_phase(block)
-        if phase not in ("live", "result", "toss"):
-            return posted_count
+    if not _playing_xi_allowed(match_key, block, state):
+        return posted_count
 
     try:
         match_info = parse_match_block(block, "toss")
@@ -1021,6 +1081,7 @@ async def post_playing_xi_if_ready(
         logger.info("Playing XI fetch returned no squads for %s", match_key)
         return posted_count
 
+    xi_posts = 0
     for team in (team1, team2):
         xi_key = make_playing_xi_key(match_key, team)
         if xi_key in state.playing_xi_posted:
@@ -1039,9 +1100,9 @@ async def post_playing_xi_if_ready(
             logger.error("Playing XI image failed for %s: %s", team, exc)
             continue
 
-        if posted_count > 0:
-            logger.info("Waiting %ds before Playing XI post", INTER_MATCH_POST_DELAY)
-            await asyncio.sleep(INTER_MATCH_POST_DELAY)
+        if xi_posts > 0:
+            logger.info("Waiting %ds before Playing XI post", PLAYING_XI_TEAM_DELAY)
+            await asyncio.sleep(PLAYING_XI_TEAM_DELAY)
 
         published = publish_photo_to_facebook(
             caption,
@@ -1056,6 +1117,7 @@ async def post_playing_xi_if_ready(
                 pass
             state.playing_xi_posted.add(xi_key)
             save_post_state(state)
+            xi_posts += 1
             posted_count += 1
             logger.info("Posted (playing_xi): %s", caption[:120])
         else:
@@ -1089,21 +1151,27 @@ async def post_missed_toss_and_playing_xi(
             continue
 
         toss_block = next((block for block in blocks if _toss_announced(block)), None)
-        xi_block = toss_block or blocks[0]
+        xi_block = _best_block_for_playing_xi(blocks, state)
         toss_done = match_key in state.toss_posted
         toss_visible = toss_block is not None
-        team1, team2 = _teams_from_block_names(xi_block)
+        if xi_block:
+            team1, team2 = _teams_from_block_names(xi_block)
+        else:
+            team1, team2 = _teams_from_block_names(blocks[0])
         xi_pending = _playing_xi_pending(match_key, team1, team2, state)
 
         if not toss_done and not toss_visible and not xi_pending:
             continue
 
+        just_posted_toss = False
         if not toss_done and toss_visible and toss_block:
             if posted_count > 0:
                 logger.info("Waiting %ds before missed toss post", INTER_MATCH_POST_DELAY)
                 await asyncio.sleep(INTER_MATCH_POST_DELAY)
             if await _publish_toss_update(toss_block, match_key, config, state):
                 posted_count += 1
+                toss_done = True
+                just_posted_toss = True
             elif xi_pending:
                 logger.info(
                     "Missed toss post failed for %s; will still try Playing XI if available",
@@ -1112,19 +1180,35 @@ async def post_missed_toss_and_playing_xi(
             else:
                 continue
 
-        if toss_done or toss_visible or xi_pending:
-            attempted.add(match_key)
-            if posted_count > 0 and _playing_xi_pending(match_key, team1, team2, state):
-                logger.info("Waiting %ds before Playing XI post", INTER_MATCH_POST_DELAY)
-                await asyncio.sleep(INTER_MATCH_POST_DELAY)
-            posted_count = await post_playing_xi_if_ready(
-                xi_block,
-                match_links,
-                page,
-                config,
-                state,
-                posted_count=posted_count,
-            )
+        if not xi_pending:
+            continue
+
+        if match_key in state.playing_xi_abandoned:
+            continue
+
+        if not xi_block:
+            if any(_match_underway(b, state) for b in blocks):
+                _abandon_playing_xi(match_key, state)
+            continue
+
+        if not _playing_xi_allowed(match_key, xi_block, state):
+            continue
+
+        attempted.add(match_key)
+        if just_posted_toss:
+            logger.info("Waiting %ds after toss before Playing XI", PLAYING_XI_AFTER_TOSS_DELAY)
+            await asyncio.sleep(PLAYING_XI_AFTER_TOSS_DELAY)
+        elif posted_count > 0:
+            logger.info("Waiting %ds before Playing XI post", INTER_MATCH_POST_DELAY)
+            await asyncio.sleep(INTER_MATCH_POST_DELAY)
+        posted_count = await post_playing_xi_if_ready(
+            xi_block,
+            match_links,
+            page,
+            config,
+            state,
+            posted_count=posted_count,
+        )
 
     return posted_count
 
@@ -1527,7 +1611,9 @@ def record_post_state(
     elif phase == "result":
         state.result_posted.add(make_match_key(block))
     elif phase == "toss":
-        state.toss_posted.add(make_match_key(block))
+        key = make_match_key(block)
+        state.toss_posted.add(key)
+        state.toss_posted_at[key] = datetime.now().isoformat()
     elif phase == "live":
         key = make_match_key(block)
         state.live_last[key] = {
@@ -1852,6 +1938,8 @@ async def run_cycle(
 
             if phase == "toss":
                 xi_attempted.add(match_key)
+                logger.info("Waiting %ds after toss before Playing XI", PLAYING_XI_AFTER_TOSS_DELAY)
+                await asyncio.sleep(PLAYING_XI_AFTER_TOSS_DELAY)
                 posted_count = await post_playing_xi_if_ready(
                     block,
                     match_links,

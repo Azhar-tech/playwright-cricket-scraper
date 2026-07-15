@@ -44,11 +44,15 @@ from playing_xi import (
     make_playing_xi_key,
     match_playing_xi_urls,
     parse_playing_xi_from_match_text,
+    _match_label_from_block,
 )
 from post_builder import build_match_post, build_result_post
 from main import (
     TRACKED_TEAMS,
     PostState,
+    PLAYING_XI_AFTER_TOSS_DELAY,
+    _best_block_for_playing_xi,
+    _playing_xi_allowed,
     _playing_xi_pending,
     _teams_from_block_names,
     _toss_announced,
@@ -638,9 +642,12 @@ def test_playing_xi_triggers() -> bool:
     _status("Playing XI pending when none posted", xi_pending, f"{team1} vs {team2}")
 
     blocked = match_key not in state.toss_posted and not _toss_announced(SAMPLE_LIVE_BLOCK.strip())
-    allowed = not (match_key not in state.toss_posted and not _toss_announced(block))
     _status("XI gate blocks live block without toss", blocked)
-    _status("XI gate allows live block with toss text", allowed)
+
+    state_with_toss = PostState()
+    state_with_toss.toss_posted.add(match_key)
+    live_blocked = not _playing_xi_allowed(match_key, block, state_with_toss)
+    _status("XI blocked when match is live (even with toss text)", live_blocked)
 
     base = (
         "https://www.cricinfo.com/series/sri-lanka-in-west-indies-2026-1538292/"
@@ -671,7 +678,53 @@ def test_playing_xi_triggers() -> bool:
         live_score_urls[0],
     )
 
-    return live_only and toss_visible and xi_pending and blocked and allowed and url_ok and suffix_ok and live_score_ok
+    return live_only and toss_visible and xi_pending and blocked and live_blocked and url_ok and suffix_ok and live_score_ok
+
+
+def test_playing_xi_live_guard() -> bool:
+    print("\n=== 3k2. Playing XI live match guard ===")
+    from datetime import datetime, timedelta
+
+    live_block = SAMPLE_LIVE_WITH_TOSS_BLOCK.strip()
+    toss_block = SAMPLE_TOSS_BLOCK.strip()
+    match_key = make_match_key(toss_block)
+
+    state = PostState()
+    state.toss_posted.add(match_key)
+    allowed_live = _playing_xi_allowed(match_key, live_block, state)
+    abandoned = match_key in state.playing_xi_abandoned
+    _status("Live block with toss text blocked", not allowed_live and abandoned)
+
+    state2 = PostState()
+    state2.toss_posted.add(match_key)
+    state2.toss_posted_at[match_key] = datetime.now().isoformat()
+    too_soon = _playing_xi_allowed(match_key, toss_block, state2)
+    _status("XI blocked within toss delay window", not too_soon)
+
+    state3 = PostState()
+    state3.toss_posted.add(match_key)
+    past = datetime.now() - timedelta(seconds=PLAYING_XI_AFTER_TOSS_DELAY + 10)
+    state3.toss_posted_at[match_key] = past.isoformat()
+    allowed_after_delay = _playing_xi_allowed(match_key, toss_block, state3)
+    _status("XI allowed after toss delay on pre-match block", allowed_after_delay)
+
+    best = _best_block_for_playing_xi([live_block, toss_block], state3)
+    best_ok = best == toss_block
+    _status("Best XI block prefers toss over live", best_ok, best or "none")
+
+    dirty_label = "1st T20I, Bulawayo — (14.4/20 ov) 121/4"
+    clean_block = f"Bangladesh tour of Zimbabwe 2026\n{dirty_label}\nBangladesh\nZimbabwe"
+    label_ok = _match_label_from_block(clean_block) == "1st T20I, Bulawayo"
+    _status("Match label strips live score suffix", label_ok, _match_label_from_block(clean_block))
+
+    return (
+        not allowed_live
+        and abandoned
+        and not too_soon
+        and allowed_after_delay
+        and best_ok
+        and label_ok
+    )
 
 
 def test_test_session_posting() -> bool:
@@ -830,7 +883,7 @@ def test_match_image_generation(keep_image: bool = False) -> bool:
         size_ok = False
         if path.exists():
             with Image.open(path) as img:
-                expected_h = 900 if phase in ("live", "toss") else 720
+                expected_h = 900 if phase == "live" else (540 if phase == "toss" else 720)
                 size_ok = img.size == (1080, expected_h)
 
         ok = path.exists() and path.stat().st_size >= 10_000 and size_ok
@@ -904,7 +957,7 @@ def test_toss_card_colors() -> bool:
         ok = False
         if path.exists() and path.stat().st_size >= 10_000:
             with Image.open(path) as img:
-                if img.size == (1080, 900):
+                if img.size == (1080, 540):
                     left_px = img.getpixel((50, 450))
                     right_px = img.getpixel((1030, 450))
                     pixels[key] = (left_px, right_px)
@@ -1438,6 +1491,7 @@ async def run(args: argparse.Namespace) -> int:
     innings_layout_ok = test_innings_layouts(keep_image=args.match_image)
     playing_xi_ok = test_playing_xi(keep_image=args.playing_xi_image)
     playing_xi_trigger_ok = test_playing_xi_triggers()
+    playing_xi_guard_ok = test_playing_xi_live_guard()
     test_session_ok = test_test_session_posting()
     scorecard_ok = test_scorecard_parsing(keep_image=args.match_image)
     posts_ok = test_rule_based_posts()
@@ -1465,6 +1519,7 @@ async def run(args: argparse.Namespace) -> int:
         and innings_layout_ok
         and playing_xi_ok
         and playing_xi_trigger_ok
+        and playing_xi_guard_ok
         and test_session_ok
         and scorecard_ok
     )

@@ -295,20 +295,22 @@ LIVE_STATS_LINE_H = 32
 # ---------------------------------------------------------------------------
 # Toss card layout constants
 # ---------------------------------------------------------------------------
-TOSS_IMAGE_HEIGHT = 900
+TOSS_IMAGE_HEIGHT = 540
 TOSS_BASE_BG = "#F5F7FA"
-TOSS_WASH_ALPHA = 0.25
+TOSS_WASH_ALPHA = 0.42
+TOSS_LEFT_X = 300
+TOSS_RIGHT_X = 780
 TOSS_FLAG_W = 140
 TOSS_FLAG_H = 98
 TOSS_FLAG_FRAME_RADIUS = 14
 TOSS_FLAG_FRAME_PAD = 8
-TOSS_FLAG_Y = 100
-TOSS_NAME_Y = 220
-TOSS_BADGE_Y = 36
-TOSS_HEADLINE_Y = 340
-TOSS_HEADLINE_PANEL_W = 900
-TOSS_HEADLINE_PANEL_H = 120
-TOSS_FOOTER_Y = 820
+TOSS_FLAG_Y = 72
+TOSS_NAME_Y = 188
+TOSS_BADGE_Y = 32
+TOSS_HEADLINE_Y = 248
+TOSS_HEADLINE_PANEL_W = 860
+TOSS_HEADLINE_PANEL_H = 96
+TOSS_FOOTER_Y = 490
 
 # ---------------------------------------------------------------------------
 # Scorecard image layout constants
@@ -501,6 +503,19 @@ def _team_kit_colors(team: str) -> tuple[str, str]:
         _, primary, secondary = TEAM_KITS[base]
         return primary, secondary
     return "#555555", "#FFFFFF"
+
+
+def _color_luminance(hex_color: str) -> float:
+    r, g, b = _hex_rgb(hex_color)
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def _toss_wash_color(team: str) -> str:
+    """Pick a visible wash color; fall back to secondary when primary is too light."""
+    primary, secondary = _team_kit_colors(team)
+    if _color_luminance(primary) > 200:
+        return secondary
+    return primary
 
 
 def _hashtag_token(text: str) -> str:
@@ -1573,8 +1588,8 @@ def _interpolate_color(
 def _draw_toss_background(width: int, height: int, team1: str, team2: str) -> Image.Image:
     """Light base with left/right team-color washes from TEAM_KITS."""
     base = _hex_rgb(TOSS_BASE_BG)
-    left_c = _hex_rgb(_team_kit_colors(team1)[0])
-    right_c = _hex_rgb(_team_kit_colors(team2)[0])
+    left_c = _hex_rgb(_toss_wash_color(team1))
+    right_c = _hex_rgb(_toss_wash_color(team2))
     img = Image.new("RGB", (width, height))
     pixels = img.load()
     half = width / 2.0
@@ -1976,8 +1991,8 @@ def _draw_toss_card(info: MatchUpdateInfo) -> Image.Image:
     img = _draw_toss_background(
         UPDATE_IMAGE_WIDTH, TOSS_IMAGE_HEIGHT, info.team1, info.team2
     )
-    _paste_flag_in_colored_frame(img, info.team1, UPDATE_LEFT_X, TOSS_FLAG_Y)
-    _paste_flag_in_colored_frame(img, info.team2, UPDATE_RIGHT_X, TOSS_FLAG_Y)
+    _paste_flag_in_colored_frame(img, info.team1, TOSS_LEFT_X, TOSS_FLAG_Y)
+    _paste_flag_in_colored_frame(img, info.team2, TOSS_RIGHT_X, TOSS_FLAG_Y)
 
     draw = ImageDraw.Draw(img)
     badge_font = _load_font(22, bold=True)
@@ -1986,8 +2001,8 @@ def _draw_toss_card(info: MatchUpdateInfo) -> Image.Image:
     footer_font = _load_font(24, bold=False)
 
     _draw_centered_text(draw, "TOSS", UPDATE_IMAGE_WIDTH // 2, TOSS_BADGE_Y, badge_font, TEXT_MUTED)
-    _draw_centered_text(draw, info.team1, UPDATE_LEFT_X, TOSS_NAME_Y, name_font, TEXT_PRIMARY)
-    _draw_centered_text(draw, info.team2, UPDATE_RIGHT_X, TOSS_NAME_Y, name_font, TEXT_PRIMARY)
+    _draw_centered_text(draw, info.team1, TOSS_LEFT_X, TOSS_NAME_Y, name_font, TEXT_PRIMARY)
+    _draw_centered_text(draw, info.team2, TOSS_RIGHT_X, TOSS_NAME_Y, name_font, TEXT_PRIMARY)
 
     if info.headline:
         headline = info.headline

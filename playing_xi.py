@@ -494,11 +494,15 @@ def _series_from_block(block: str) -> str:
     return ""
 
 
+def _clean_match_label(line: str) -> str:
+    return re.sub(r"\s*[—–-]\s*\([^)]*ov[^)]*\).*$", "", line, flags=re.IGNORECASE).strip()
+
+
 def _match_label_from_block(block: str) -> str:
     for line in block.splitlines():
         stripped = line.strip()
         if MATCH_LABEL_PATTERN.search(stripped):
-            return stripped
+            return _clean_match_label(stripped)
     return ""
 
 
