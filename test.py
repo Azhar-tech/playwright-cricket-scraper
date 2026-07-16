@@ -51,16 +51,20 @@ from main import (
     TRACKED_TEAMS,
     PostState,
     PLAYING_XI_AFTER_TOSS_DELAY,
+    PLAYING_XI_PENDING_INTERVAL,
     _best_block_for_playing_xi,
     _playing_xi_allowed,
     _playing_xi_pending,
     _teams_from_block_names,
     _toss_announced,
+    _toss_xi_delay_remaining,
     block_match_phase,
     detect_format,
     extract_all_postable_blocks,
     extract_tracked_match_data,
     generate_post,
+    get_sleep_interval,
+    get_xi_pending_sleep_interval,
     is_tracked_match,
     make_match_key,
     make_preview_key,
@@ -698,8 +702,13 @@ def test_playing_xi_live_guard() -> bool:
     state2 = PostState()
     state2.toss_posted.add(match_key)
     state2.toss_posted_at[match_key] = datetime.now().isoformat()
-    too_soon = _playing_xi_allowed(match_key, toss_block, state2)
-    _status("XI blocked within toss delay window", not too_soon)
+    allowed_before_delay = _playing_xi_allowed(match_key, toss_block, state2)
+    delay_remaining = _toss_xi_delay_remaining(match_key, state2)
+    _status(
+        "XI allowed before delay wait (delay handled in post_playing_xi_if_ready)",
+        allowed_before_delay and delay_remaining > 100,
+        f"remaining={int(delay_remaining)}s",
+    )
 
     state3 = PostState()
     state3.toss_posted.add(match_key)
@@ -720,10 +729,60 @@ def test_playing_xi_live_guard() -> bool:
     return (
         not allowed_live
         and abandoned
-        and not too_soon
+        and allowed_before_delay
+        and delay_remaining > 100
         and allowed_after_delay
         and best_ok
         and label_ok
+    )
+
+
+def test_playing_xi_retry_interval() -> bool:
+    print("\n=== 3k3. Playing XI retry interval ===")
+    from datetime import datetime
+
+    toss_block = SAMPLE_TOSS_BLOCK.strip()
+    match_key = make_match_key(toss_block)
+    team1, team2 = _teams_from_block_names(toss_block)
+
+    state = PostState()
+    state.toss_posted.add(match_key)
+    state.toss_posted_at[match_key] = datetime.now().isoformat()
+
+    pending = _playing_xi_pending(match_key, team1, team2, state)
+    xi_interval = get_xi_pending_sleep_interval(toss_block, state)
+    sleep_with_pending = get_sleep_interval(toss_block, state)
+    sleep_default = get_sleep_interval(toss_block)
+
+    _status("XI still pending after toss", pending)
+    _status(
+        "Shorter interval when XI pending",
+        xi_interval == PLAYING_XI_PENDING_INTERVAL,
+        str(xi_interval),
+    )
+    _status(
+        "get_sleep_interval uses XI pending interval",
+        sleep_with_pending == PLAYING_XI_PENDING_INTERVAL,
+        str(sleep_with_pending),
+    )
+    _status(
+        "Default interval without pending state",
+        sleep_default != PLAYING_XI_PENDING_INTERVAL or not pending,
+        str(sleep_default),
+    )
+
+    done_state = PostState()
+    done_state.toss_posted.add(match_key)
+    for team in (team1, team2):
+        done_state.playing_xi_posted.add(make_playing_xi_key(match_key, team))
+    no_interval = get_xi_pending_sleep_interval(toss_block, done_state)
+    _status("No short interval when both XI posted", no_interval is None)
+
+    return (
+        pending
+        and xi_interval == PLAYING_XI_PENDING_INTERVAL
+        and sleep_with_pending == PLAYING_XI_PENDING_INTERVAL
+        and no_interval is None
     )
 
 
@@ -1492,6 +1551,7 @@ async def run(args: argparse.Namespace) -> int:
     playing_xi_ok = test_playing_xi(keep_image=args.playing_xi_image)
     playing_xi_trigger_ok = test_playing_xi_triggers()
     playing_xi_guard_ok = test_playing_xi_live_guard()
+    playing_xi_retry_ok = test_playing_xi_retry_interval()
     test_session_ok = test_test_session_posting()
     scorecard_ok = test_scorecard_parsing(keep_image=args.match_image)
     posts_ok = test_rule_based_posts()
@@ -1520,6 +1580,7 @@ async def run(args: argparse.Namespace) -> int:
         and playing_xi_ok
         and playing_xi_trigger_ok
         and playing_xi_guard_ok
+        and playing_xi_retry_ok
         and test_session_ok
         and scorecard_ok
     )

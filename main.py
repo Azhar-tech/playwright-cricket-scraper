@@ -173,6 +173,7 @@ POST_INTERVAL = 1800  # 30 minutes between scrape cycles
 INTER_MATCH_POST_DELAY = 60  # 1 minute between posts in the same cycle
 PLAYING_XI_AFTER_TOSS_DELAY = 150  # seconds after toss before first XI post
 PLAYING_XI_TEAM_DELAY = 60  # seconds between team 1 and team 2 XI posts
+PLAYING_XI_PENDING_INTERVAL = max(180, PLAYING_XI_AFTER_TOSS_DELAY + 60)
 FACEBOOK_BG_CHAR_LIMIT = 130
 
 FACEBOOK_BG_PRESETS = [
@@ -962,21 +963,27 @@ def _playing_xi_allowed(match_key: str, block: str, state: PostState) -> bool:
     if match_key not in state.toss_posted:
         logger.info("Playing XI skipped for %s — toss not posted yet", match_key)
         return False
-    posted_at = state.toss_posted_at.get(match_key)
-    if posted_at:
-        try:
-            elapsed = (datetime.now() - datetime.fromisoformat(posted_at)).total_seconds()
-            if elapsed < PLAYING_XI_AFTER_TOSS_DELAY:
-                remaining = int(PLAYING_XI_AFTER_TOSS_DELAY - elapsed)
-                logger.info(
-                    "Playing XI skipped for %s — waiting %ds after toss",
-                    match_key,
-                    remaining,
-                )
-                return False
-        except ValueError:
-            pass
     return True
+
+
+def _toss_xi_delay_remaining(match_key: str, state: PostState) -> float:
+    if match_key not in state.toss_posted:
+        return 0.0
+    posted_at = state.toss_posted_at.get(match_key)
+    if not posted_at:
+        return 0.0
+    try:
+        elapsed = (datetime.now() - datetime.fromisoformat(posted_at)).total_seconds()
+        return max(0.0, PLAYING_XI_AFTER_TOSS_DELAY - elapsed)
+    except ValueError:
+        return 0.0
+
+
+async def _wait_for_toss_xi_delay(match_key: str, state: PostState) -> None:
+    remaining = _toss_xi_delay_remaining(match_key, state)
+    if remaining > 0:
+        logger.info("Waiting %.0fs after toss before Playing XI", remaining)
+        await asyncio.sleep(remaining)
 
 
 def _best_block_for_playing_xi(blocks: list[str], state: PostState) -> str | None:
@@ -1055,6 +1062,15 @@ async def post_playing_xi_if_ready(
     posted_count: int = 0,
 ) -> int:
     match_key = make_match_key(block)
+    if match_key not in state.toss_posted:
+        logger.info("Playing XI skipped for %s — toss not posted yet", match_key)
+        return posted_count
+    if match_key in state.playing_xi_abandoned:
+        logger.info("Playing XI skipped for %s — abandoned", match_key)
+        return posted_count
+
+    await _wait_for_toss_xi_delay(match_key, state)
+
     if not _playing_xi_allowed(match_key, block, state):
         return posted_count
 
@@ -1191,14 +1207,10 @@ async def post_missed_toss_and_playing_xi(
                 _abandon_playing_xi(match_key, state)
             continue
 
-        if not _playing_xi_allowed(match_key, xi_block, state):
+        if match_key not in state.toss_posted:
             continue
 
-        attempted.add(match_key)
-        if just_posted_toss:
-            logger.info("Waiting %ds after toss before Playing XI", PLAYING_XI_AFTER_TOSS_DELAY)
-            await asyncio.sleep(PLAYING_XI_AFTER_TOSS_DELAY)
-        elif posted_count > 0:
+        if posted_count > 0 and not just_posted_toss:
             logger.info("Waiting %ds before Playing XI post", INTER_MATCH_POST_DELAY)
             await asyncio.sleep(INTER_MATCH_POST_DELAY)
         posted_count = await post_playing_xi_if_ready(
@@ -1209,6 +1221,7 @@ async def post_missed_toss_and_playing_xi(
             state,
             posted_count=posted_count,
         )
+        attempted.add(match_key)
 
     return posted_count
 
@@ -1628,7 +1641,35 @@ def record_post_state(
     save_post_state(state)
 
 
-def get_sleep_interval(text: str) -> int:
+def get_xi_pending_sleep_interval(text: str, state: PostState) -> int | None:
+    """Shorter retry when toss is posted but Playing XI squads are still pending."""
+    blocks_by_key: dict[str, list[str]] = {}
+    for block in normalize_match_blocks(text):
+        if not block_has_tracked_team(block):
+            continue
+        blocks_by_key.setdefault(make_match_key(block), []).append(block)
+
+    for match_key, blocks in blocks_by_key.items():
+        if match_key in state.playing_xi_abandoned:
+            continue
+        if match_key not in state.toss_posted:
+            continue
+        xi_block = _best_block_for_playing_xi(blocks, state)
+        if not xi_block:
+            continue
+        if _match_underway(xi_block, state):
+            continue
+        team1, team2 = _teams_from_block_names(xi_block)
+        if _playing_xi_pending(match_key, team1, team2, state):
+            return PLAYING_XI_PENDING_INTERVAL
+    return None
+
+
+def get_sleep_interval(text: str, state: PostState | None = None) -> int:
+    if state is not None:
+        xi_interval = get_xi_pending_sleep_interval(text, state)
+        if xi_interval is not None:
+            return xi_interval
     for block in normalize_match_blocks(text):
         if block_has_tracked_team(block) and detect_format(block) == "TEST":
             if SCORE_PATTERN.search(block) and not UPCOMING_PATTERN.search(block):
@@ -1937,9 +1978,6 @@ async def run_cycle(
             logger.info("Posted (%s): %s", phase, post_text[:120])
 
             if phase == "toss":
-                xi_attempted.add(match_key)
-                logger.info("Waiting %ds after toss before Playing XI", PLAYING_XI_AFTER_TOSS_DELAY)
-                await asyncio.sleep(PLAYING_XI_AFTER_TOSS_DELAY)
                 posted_count = await post_playing_xi_if_ready(
                     block,
                     match_links,
@@ -1948,6 +1986,7 @@ async def run_cycle(
                     _post_state,
                     posted_count=posted_count,
                 )
+                xi_attempted.add(match_key)
 
             if phase == "live" and innings_break and match_fmt in ("T20", "ODI"):
                 sc_key = f"{match_key}|{update_info.batting_team}"
@@ -2001,11 +2040,11 @@ async def run_cycle(
         )
 
         if posted_count == 0:
-            sleep_seconds = get_sleep_interval(raw_data)
+            sleep_seconds = get_sleep_interval(raw_data, _post_state)
             logger.info("No new posts this cycle; waiting %ds", sleep_seconds)
             return sleep_seconds
 
-        sleep_seconds = get_sleep_interval(raw_data)
+        sleep_seconds = get_sleep_interval(raw_data, _post_state)
         logger.info(
             "Published %d post(s); next check in %ds",
             posted_count,
