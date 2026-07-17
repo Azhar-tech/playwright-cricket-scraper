@@ -59,7 +59,7 @@ FLAGCDN_CODES: dict[str, str] = {
 }
 
 TEAM_SLUGS: dict[str, str] = {
-    "India": "india",
+    "India": "india", 
     "England": "england",
     "Australia": "australia",
     "New Zealand": "new-zealand",
@@ -766,6 +766,19 @@ def _finalize_test_session(info: MatchUpdateInfo, block: str, fmt: str) -> None:
     _apply_test_session_headline(info, block)
 
 
+def _chasing_team_from_scores(info: MatchUpdateInfo, fmt: str) -> str | None:
+    """Pick the chasing team from innings completeness, not score column order."""
+    if not info.score1 or not info.score2:
+        return None
+    t1_done = _innings_complete(info.score1, info.overs1, fmt)
+    t2_done = _innings_complete(info.score2, info.overs2, fmt)
+    if t1_done and not t2_done:
+        return info.team2
+    if t2_done and not t1_done:
+        return info.team1
+    return None
+
+
 def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
     fmt = _detect_format(block)
     target, runs_needed, balls_remaining, overs_remaining = _parse_chase_meta(block)
@@ -778,14 +791,59 @@ def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
     team1_yet = _team_yet_to_bat(block, info.team1)
     team2_yet = _team_yet_to_bat(block, info.team2)
 
+    chasing_team = _chasing_team_from_scores(info, fmt)
+    if chasing_team and fmt in ("T20", "ODI"):
+        info.innings_status = "chase"
+        info.batting_team = chasing_team
+        info.bowling_team = info.team2 if chasing_team == info.team1 else info.team1
+        info.target = target
+        info.runs_needed = runs_needed
+        info.balls_remaining = balls_remaining
+        info.overs_remaining = overs_remaining
+        if info.runs_needed is None and target is not None:
+            chase_score = info.score1 if chasing_team == info.team1 else info.score2
+            runs = _runs_from_score(chase_score)
+            if runs is not None:
+                info.runs_needed = max(target - runs, 0)
+        abbrev = _team_abbrev(info.batting_team)
+        if info.runs_needed is not None:
+            if info.overs_remaining:
+                info.headline = (
+                    f"{abbrev} need {info.runs_needed} runs in {info.overs_remaining} overs to win"
+                )
+            elif info.balls_remaining is not None:
+                info.headline = (
+                    f"{abbrev} need {info.runs_needed} runs from {info.balls_remaining} balls"
+                )
+            else:
+                info.headline = f"{abbrev} need {info.runs_needed} runs to win"
+        elif info.headline == "":
+            chase_score = info.score1 if chasing_team == info.team1 else info.score2
+            chase_overs = info.overs1 if chasing_team == info.team1 else info.overs2
+            ov = chase_overs.strip("()") if chase_overs else ""
+            first_score = info.score2 if chasing_team == info.team1 else info.score1
+            first_overs = info.overs2 if chasing_team == info.team1 else info.overs1
+            first_ov = first_overs.strip("()") if first_overs else ""
+            info.headline = (
+                f"LIVE: {_team_abbrev(info.bowling_team)} {first_score}"
+                f"{f' ({first_ov} ov)' if first_ov else ''} vs "
+                f"{abbrev} {chase_score}{f' ({ov} ov)' if ov else ''}"
+            )
+        _finalize_test_session(info, block, fmt)
+        return
+
     if info.score2 or any("T:" in line.upper() for line in block.splitlines()):
         info.innings_status = "chase"
         info.target = target
         info.runs_needed = runs_needed
         info.balls_remaining = balls_remaining
         info.overs_remaining = overs_remaining
-        info.batting_team = info.team2 if info.score2 else info.team1
-        info.bowling_team = info.team1 if info.batting_team == info.team2 else info.team2
+        if chasing_team:
+            info.batting_team = chasing_team
+            info.bowling_team = info.team2 if chasing_team == info.team1 else info.team1
+        else:
+            info.batting_team = info.team2 if info.score2 else info.team1
+            info.bowling_team = info.team1 if info.batting_team == info.team2 else info.team2
 
         if info.runs_needed is None and target is not None and info.score2:
             runs = _runs_from_score(info.score2)

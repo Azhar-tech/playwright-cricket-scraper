@@ -57,6 +57,7 @@ from main import (
     _first_innings_batting_team,
     _playing_xi_allowed,
     _playing_xi_pending,
+    _scorecard_skip_reason,
     _should_post_innings_scorecard,
     _teams_from_block_names,
     _toss_announced,
@@ -281,6 +282,24 @@ Pakistan
 India
 (4/20 ov, T:181) 35/1
 India need 146 runs from 94 balls
+"""
+
+SAMPLE_BAN_ZIM_CHASE_BLOCK = """
+LIVE
+ZIM vs BAN, 2nd T20I, Bulawayo
+Zimbabwe
+141/10
+Bangladesh
+45/2 (10 ov)
+"""
+
+SAMPLE_BAN_ZIM_CHASE_REVERSED = """
+LIVE
+BAN vs ZIM, 2nd T20I, Bulawayo
+Bangladesh
+45/2 (10 ov)
+Zimbabwe
+141/10
 """
 
 SAMPLE_FIRST_INNINGS_ODI = """
@@ -1558,6 +1577,92 @@ IND won by 7 wickets
     return all_ok
 
 
+def test_ban_zim_chase_scorecard() -> bool:
+    print("\n=== 4f. BAN vs ZIM Chase Scorecard Detection ===")
+    all_ok = True
+
+    def _bz(label: str, cond: bool, detail: str = "") -> None:
+        nonlocal all_ok
+        _status(label, cond, detail)
+        if not cond:
+            all_ok = False
+
+    state = PostState()
+
+    for label, sample in (
+        ("Zimbabwe listed first", SAMPLE_BAN_ZIM_CHASE_BLOCK.strip()),
+        ("Bangladesh listed first", SAMPLE_BAN_ZIM_CHASE_REVERSED.strip()),
+    ):
+        info = parse_match_block(sample, "live")
+        info.match_key = make_match_key(sample)
+        _bz(
+            f"{label}: chase detected",
+            info.innings_status == "chase",
+            info.innings_status,
+        )
+        _bz(
+            f"{label}: Bangladesh chasing",
+            info.batting_team == "Bangladesh",
+            info.batting_team,
+        )
+        _bz(
+            f"{label}: Zimbabwe is first innings team",
+            _first_innings_batting_team(info) == "Zimbabwe",
+            _first_innings_batting_team(info),
+        )
+        _bz(
+            f"{label}: scorecard eligible",
+            _should_post_innings_scorecard(info, state, sample),
+        )
+        skip = _scorecard_skip_reason(info, state, sample)
+        _bz(f"{label}: no skip reason", skip is None, skip or "")
+
+    return all_ok
+
+
+def test_scorecard_catchup_on_live_cooldown() -> bool:
+    print("\n=== 4g. Scorecard Catch-up During Live Cooldown ===")
+    all_ok = True
+
+    def _cd(label: str, cond: bool, detail: str = "") -> None:
+        nonlocal all_ok
+        _status(label, cond, detail)
+        if not cond:
+            all_ok = False
+
+    state = PostState()
+    block = SAMPLE_BAN_ZIM_CHASE_BLOCK.strip()
+    match_key = make_match_key(block)
+    info = parse_match_block(block, "live")
+    info.match_key = match_key
+
+    from datetime import datetime, timedelta
+
+    state.live_last[match_key] = {
+        "at": (datetime.now() - timedelta(seconds=60)).isoformat(),
+        "signature": make_live_signature(info),
+        "text": "prior live post",
+    }
+
+    live_allowed = should_post_live(
+        block,
+        make_live_signature(info),
+        state,
+        fmt="T20",
+    )
+    _cd("Live update blocked on cooldown", not live_allowed)
+    _cd(
+        "Scorecard still eligible during chase",
+        _should_post_innings_scorecard(info, state, block),
+    )
+    _cd(
+        "Skip reason absent while chase live",
+        _scorecard_skip_reason(info, state, block) is None,
+    )
+
+    return all_ok
+
+
 async def test_gemini(raw_data: str) -> str | None:
     print("\n=== 4b. Gemini post generation (optional) ===")
     post = await generate_post(raw_data)
@@ -1651,6 +1756,8 @@ async def run(args: argparse.Namespace) -> int:
     test_session_ok = test_test_session_posting()
     scorecard_ok = test_scorecard_parsing(keep_image=args.match_image)
     scorecard_trigger_ok = test_scorecard_trigger_window()
+    ban_zim_sc_ok = test_ban_zim_chase_scorecard()
+    scorecard_cooldown_ok = test_scorecard_catchup_on_live_cooldown()
     posts_ok = test_rule_based_posts()
     gemini_input = extract_tracked_match_data(raw_data) or raw_data
     post_text = await test_gemini(gemini_input.split("\n\n---\n\n")[0])
@@ -1681,6 +1788,8 @@ async def run(args: argparse.Namespace) -> int:
         and test_session_ok
         and scorecard_ok
         and scorecard_trigger_ok
+        and ban_zim_sc_ok
+        and scorecard_cooldown_ok
     )
     if fb_ok and multi_ok and rules_ok and preview_ok and posts_ok:
         if post_text and post_text != "rule-based":

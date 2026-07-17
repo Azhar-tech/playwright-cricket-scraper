@@ -906,22 +906,81 @@ def _first_innings_batting_team(info: MatchUpdateInfo) -> str:
     return info.batting_team
 
 
+def _scorecard_skip_reason(
+    info: MatchUpdateInfo,
+    state: PostState,
+    block: str,
+) -> str | None:
+    """Return a skip reason, or None when the innings scorecard should post."""
+    if block_match_phase(block, state=state) == "result":
+        return f"match finished (phase=result) for {info.match_key}"
+    if re.search(r"\bwon by\b", block, re.IGNORECASE):
+        return f"match finished (won by) for {info.match_key}"
+    first_team = _first_innings_batting_team(info)
+    if not first_team:
+        return f"no first-innings team for {info.match_key}"
+    sc_key = f"{info.match_key}|{first_team}"
+    if sc_key in state.scorecard_innings_posted:
+        return f"already posted {sc_key}"
+    if info.innings_status not in ("innings_break", "chase"):
+        return f"innings_status={info.innings_status} for {info.match_key}"
+    return None
+
+
 def _should_post_innings_scorecard(
     info: MatchUpdateInfo,
     state: PostState,
     block: str,
 ) -> bool:
-    if block_match_phase(block, state=state) == "result":
-        return False
-    if re.search(r"\bwon by\b", block, re.IGNORECASE):
-        return False
-    first_team = _first_innings_batting_team(info)
-    if not first_team:
-        return False
-    sc_key = f"{info.match_key}|{first_team}"
-    if sc_key in state.scorecard_innings_posted:
-        return False
-    return info.innings_status in ("innings_break", "chase")
+    return _scorecard_skip_reason(info, state, block) is None
+
+
+async def _try_innings_scorecard(
+    page: Page,
+    block: str,
+    update_info: MatchUpdateInfo,
+    match_key: str,
+    match_fmt: str,
+    match_links: dict[str, str],
+    config: dict[str, str],
+    state: PostState,
+    *,
+    posted_count: int,
+    scorecard_attempted: set[str],
+) -> int:
+    """Attempt a first-innings scorecard post when eligible."""
+    if match_fmt not in ("T20", "ODI"):
+        return posted_count
+
+    skip = _scorecard_skip_reason(update_info, state, block)
+    if skip:
+        logger.info("Scorecard skip: %s", skip)
+        return posted_count
+
+    if match_key in scorecard_attempted:
+        logger.info("Scorecard skip: already attempted this cycle for %s", match_key)
+        return posted_count
+
+    match_url = _resolve_match_url(match_key, match_links)
+    if not match_url:
+        logger.info("Scorecard skip: no ESPN URL for %s", match_key)
+        return posted_count
+
+    first_team = _first_innings_batting_team(update_info)
+    sc_key = f"{match_key}|{first_team}"
+    logger.info("Scorecard attempting catch-up for %s", sc_key)
+
+    if posted_count > 0:
+        logger.info("Waiting %ds before innings scorecard post", INTER_MATCH_POST_DELAY)
+        await asyncio.sleep(INTER_MATCH_POST_DELAY)
+
+    if await _publish_innings_scorecard(
+        page, match_url, update_info, match_key, config, state
+    ):
+        posted_count += 1
+
+    scorecard_attempted.add(match_key)
+    return posted_count
 
 
 async def fetch_innings_scorecard(
@@ -1044,7 +1103,8 @@ async def post_missed_innings_scorecard(
     for match_key, blocks in blocks_by_key.items():
         if match_key in attempted:
             continue
-        if detect_format(blocks[0]) not in ("T20", "ODI"):
+        match_fmt = detect_format(blocks[0])
+        if match_fmt not in ("T20", "ODI"):
             continue
 
         live_block = next(
@@ -1052,26 +1112,23 @@ async def post_missed_innings_scorecard(
             None,
         )
         if not live_block:
+            logger.info("Scorecard skip: no live block for %s", match_key)
             continue
 
         update_info = parse_match_block(live_block, "live")
         update_info.match_key = match_key
-        if not _should_post_innings_scorecard(update_info, state, live_block):
-            continue
-
-        match_url = _resolve_match_url(match_key, match_links)
-        if not match_url:
-            continue
-
-        if posted_count > 0:
-            logger.info("Waiting %ds before missed innings scorecard post", INTER_MATCH_POST_DELAY)
-            await asyncio.sleep(INTER_MATCH_POST_DELAY)
-
-        if await _publish_innings_scorecard(
-            page, match_url, update_info, match_key, config, state
-        ):
-            posted_count += 1
-        attempted.add(match_key)
+        posted_count = await _try_innings_scorecard(
+            page,
+            live_block,
+            update_info,
+            match_key,
+            match_fmt,
+            match_links,
+            config,
+            state,
+            posted_count=posted_count,
+            scorecard_attempted=attempted,
+        )
 
     return posted_count
 
@@ -2091,6 +2148,18 @@ async def run_cycle(
                         image_path.unlink(missing_ok=True)
                     except OSError:
                         pass
+                posted_count = await _try_innings_scorecard(
+                    page,
+                    block,
+                    update_info,
+                    match_key,
+                    match_fmt,
+                    match_links,
+                    config,
+                    _post_state,
+                    posted_count=posted_count,
+                    scorecard_attempted=scorecard_attempted,
+                )
                 continue
 
             if posted_count > 0:
@@ -2147,19 +2216,19 @@ async def run_cycle(
                 )
                 xi_attempted.add(match_key)
 
-            if (
-                phase == "live"
-                and match_fmt in ("T20", "ODI")
-                and _should_post_innings_scorecard(update_info, _post_state, block)
-            ):
-                match_url = _resolve_match_url(match_key, match_links)
-                if match_url:
-                    await asyncio.sleep(INTER_MATCH_POST_DELAY)
-                    if await _publish_innings_scorecard(
-                        page, match_url, update_info, match_key, config, _post_state
-                    ):
-                        posted_count += 1
-                scorecard_attempted.add(match_key)
+            if phase == "live" and match_fmt in ("T20", "ODI"):
+                posted_count = await _try_innings_scorecard(
+                    page,
+                    block,
+                    update_info,
+                    match_key,
+                    match_fmt,
+                    match_links,
+                    config,
+                    _post_state,
+                    posted_count=posted_count,
+                    scorecard_attempted=scorecard_attempted,
+                )
 
         posted_count = await post_missed_toss_and_playing_xi(
             raw_data,
