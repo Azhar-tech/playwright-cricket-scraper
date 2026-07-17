@@ -313,37 +313,31 @@ TOSS_HEADLINE_PANEL_H = 96
 TOSS_FOOTER_Y = 490
 
 # ---------------------------------------------------------------------------
-# Scorecard image layout constants
+# Scorecard image layout constants (premium dark)
 # ---------------------------------------------------------------------------
-SC_FLAG_W = 80
-SC_FLAG_H = 56
-SC_FLAG_RADIUS = 6
-SC_ACCENT_H = 6
-SC_LEFT_CX = 130
-SC_RIGHT_CX = 950
-SC_FLAG_Y = 10
-SC_ABBREV_Y = 78
-SC_HDR_LABEL_Y = 112
-SC_BATTING_INFO_Y = 140
-SC_BATTING_INFO_H = 48
-SC_COL_HDR_Y = 192
-SC_COL_HDR_H = 36
-SC_ROW_START_Y = 230
-SC_ROW_H = 64
-SC_EXTRAS_H = 48
-SC_TOTAL_H = 52
-SC_SC_FOOTER_H = 36
-SC_BOTTOM_PAD = 40
-SC_NAME_X = 22
-SC_DIS_X = 372
-SC_R_RIGHT = 882
-SC_B_RIGHT = 930
-SC_4S_RIGHT = 975
-SC_6S_RIGHT = 1025
-SC_COL_HEADER_BG = "#E8EAED"
-SC_ROW_ALT_BG = "#F8F9FA"
-SC_BATTING_INFO_BG = "#F1F3F4"
-SC_NOT_OUT_COLOR = "#1A73E8"
+SC_PREMIUM_DARK = "#0a1628"
+SC_PREMIUM_HEADER_H = 156
+SC_PREMIUM_FLAG_W = 76
+SC_PREMIUM_FLAG_H = 52
+SC_PREMIUM_FLAG_Y = 18
+SC_PREMIUM_LEFT_CX = 200
+SC_PREMIUM_RIGHT_CX = 880
+SC_PREMIUM_TITLE_Y = 88
+SC_PREMIUM_SERIES_Y = 124
+SC_PREMIUM_ROW_START = 168
+SC_PREMIUM_ROW_H = 46
+SC_PREMIUM_DNB_H = 40
+SC_PREMIUM_FOOTER_H = 96
+SC_PREMIUM_BOTTOM_PAD = 20
+SC_PREMIUM_NAME_X = 28
+SC_PREMIUM_DIS_X = 340
+SC_PREMIUM_R_RIGHT = 900
+SC_PREMIUM_B_RIGHT = 980
+SC_PREMIUM_TEXT = "#F5F7FA"
+SC_PREMIUM_MUTED = "#B0BEC5"
+SC_PREMIUM_NOT_OUT = "#4FC3F7"
+SC_PREMIUM_TOP_SCORER_BG = (255, 255, 255, 28)
+SC_PREMIUM_ROW_DIVIDER = "#1E2D42"
 
 MONTHS = {
     "january": 1,
@@ -433,6 +427,7 @@ class ScorecardInfo:
     series: str
     format_tag: str
     batters: list[ScorecardBatter] = field(default_factory=list)
+    squad_names: list[str] = field(default_factory=list)
     extras: str = ""
     extras_runs: int = 0
     total_runs: int = 0
@@ -2314,6 +2309,7 @@ def parse_innings_scorecard_text(
         series=series,
         format_tag=format_tag,
         batters=batters,
+        squad_names=player_names,
         extras=extras_str,
         extras_runs=extras_runs,
         total_runs=total_runs,
@@ -2326,159 +2322,256 @@ def parse_innings_scorecard_text(
 # ---------------------------------------------------------------------------
 
 
+def _draw_vertical_gradient(
+    width: int,
+    height: int,
+    top: str,
+    mid: str,
+    bottom: str,
+) -> Image.Image:
+    img = Image.new("RGB", (width, height))
+    c_top = _hex_rgb(top)
+    c_mid = _hex_rgb(mid)
+    c_bottom = _hex_rgb(bottom)
+    split = int(height * 0.55)
+    pixels = img.load()
+    for y in range(height):
+        if y <= split:
+            t = y / max(split, 1)
+            color = _interpolate_color(c_top, c_mid, t)
+        else:
+            t = (y - split) / max(height - split, 1)
+            color = _interpolate_color(c_mid, c_bottom, t)
+        for x in range(width):
+            pixels[x, y] = color  # type: ignore[index]
+    return img
+
+
+def _sc_player_token(name: str) -> str:
+    parts = [p for p in re.sub(r"[^A-Za-z\s]", "", name).split() if p]
+    if not parts:
+        return name.upper()[:10]
+    if len(parts) == 1:
+        return parts[0].upper()
+    return parts[0].upper() if len(parts[0]) >= 4 else parts[-1].upper()
+
+
+def _abbrev_dismissal(dismissal: str) -> str:
+    if not dismissal or re.search(r"\bnot\s+out\b", dismissal, re.IGNORECASE):
+        return "NOT OUT"
+    d = dismissal.strip()
+    if re.match(r"run\s+out", d, re.IGNORECASE):
+        return "run out"
+    m = re.match(r"^c\s+(.+?)\s+b\s+(.+)$", d, re.IGNORECASE)
+    if m:
+        return f"c {_sc_player_token(m.group(1))} b {_sc_player_token(m.group(2))}"
+    m = re.match(r"^st\s+(.+?)\s+b\s+(.+)$", d, re.IGNORECASE)
+    if m:
+        return f"st {_sc_player_token(m.group(1))} b {_sc_player_token(m.group(2))}"
+    m = re.match(r"^lbw\s+b\s+(.+)$", d, re.IGNORECASE)
+    if m:
+        return f"lbw b {_sc_player_token(m.group(1))}"
+    m = re.match(r"^b\s+(.+)$", d, re.IGNORECASE)
+    if m:
+        return f"b {_sc_player_token(m.group(1))}"
+    return d.upper()[:36]
+
+
+def _format_dnb_players(squad_names: list[str], batters: list[ScorecardBatter]) -> str:
+    if not squad_names:
+        return ""
+    batted = {_sc_clean_player_name(b.name).upper() for b in batters}
+    dnb: list[str] = []
+    for name in squad_names:
+        clean = _sc_clean_player_name(name)
+        if clean.upper() not in batted:
+            dnb.append(clean.upper())
+    if not dnb:
+        return ""
+    return ", ".join(dnb) + "  DNB"
+
+
+def _sc_batter_display_name(name: str) -> str:
+    clean = _sc_clean_player_name(name)
+    parts = clean.split()
+    if not parts:
+        return name.upper()[:14]
+    if len(parts) == 1:
+        return parts[0].upper()
+    return parts[-1].upper()
+
+
 def _draw_scorecard_card(info: ScorecardInfo) -> Image.Image:
-    """Draw a batting innings scorecard image."""
-    num_rows = min(len(info.batters), 11)
-    extras_y = SC_ROW_START_Y + num_rows * SC_ROW_H
-    total_y = extras_y + SC_EXTRAS_H
-    footer_y = total_y + SC_TOTAL_H
-    img_h = footer_y + SC_SC_FOOTER_H + SC_BOTTOM_PAD
+    """Draw a premium dark team-branded batting innings scorecard."""
+    batters = info.batters[:11]
+    num_rows = len(batters)
+    dnb_text = _format_dnb_players(info.squad_names, batters)
+    dnb_h = SC_PREMIUM_DNB_H if dnb_text else 0
+    footer_y = SC_PREMIUM_ROW_START + num_rows * SC_PREMIUM_ROW_H + dnb_h
+    img_h = footer_y + SC_PREMIUM_FOOTER_H + SC_PREMIUM_BOTTOM_PAD
 
-    img = Image.new("RGB", (UPDATE_IMAGE_WIDTH, img_h), BACKGROUND)
+    primary, secondary = _team_kit_colors(info.batting_team)
+    img = _draw_vertical_gradient(
+        UPDATE_IMAGE_WIDTH, img_h, primary, secondary, SC_PREMIUM_DARK
+    )
     draw = ImageDraw.Draw(img)
 
-    # Fonts
-    abbrev_font = _load_font(28, bold=True)
-    label_font = _load_font(22)
-    batting_info_font = _load_font(26, bold=True)
-    col_hdr_font = _load_font(18)
-    name_font_bold = _load_font(24, bold=True)
-    name_font_reg = _load_font(24)
-    dis_font = _load_font(21)
-    r_font = _load_font(26, bold=True)
-    stat_font = _load_font(21)
-    extras_font = _load_font(21)
-    total_name_font = _load_font(22, bold=True)
-    total_val_font = _load_font(26, bold=True)
-    footer_font_sc = _load_font(20)
+    header_font = _load_font(30, bold=True)
+    series_font = _load_font(20)
+    name_font_bold = _load_font(22, bold=True)
+    name_font_reg = _load_font(22)
+    dis_font = _load_font(19)
+    stat_font = _load_font(24, bold=True)
+    stat_font_reg = _load_font(20)
+    dnb_font = _load_font(18)
+    footer_label_font = _load_font(20)
+    footer_total_font = _load_font(44, bold=True)
 
-    # Accent bar in the batting team's primary colour
-    primary_color, _ = _team_kit_colors(info.batting_team)
-    draw.rectangle([(0, 0), (UPDATE_IMAGE_WIDTH, SC_ACCENT_H)], fill=primary_color)
-
-    # Flags and team abbreviations
-    left_flag = _load_team_flag(info.team1, SC_FLAG_W, SC_FLAG_H, SC_FLAG_RADIUS)
-    right_flag = _load_team_flag(info.team2, SC_FLAG_W, SC_FLAG_H, SC_FLAG_RADIUS)
-    _paste_flag_centered(img, left_flag, SC_LEFT_CX, SC_FLAG_Y)
-    _paste_flag_centered(img, right_flag, SC_RIGHT_CX, SC_FLAG_Y)
+    left_flag = _load_team_flag(
+        info.team1, SC_PREMIUM_FLAG_W, SC_PREMIUM_FLAG_H, 6
+    )
+    right_flag = _load_team_flag(
+        info.team2, SC_PREMIUM_FLAG_W, SC_PREMIUM_FLAG_H, 6
+    )
+    _paste_flag_centered(img, left_flag, SC_PREMIUM_LEFT_CX, SC_PREMIUM_FLAG_Y)
+    _paste_flag_centered(img, right_flag, SC_PREMIUM_RIGHT_CX, SC_PREMIUM_FLAG_Y)
 
     draw = ImageDraw.Draw(img)
-    _draw_centered_text(draw, _team_abbrev(info.team1), SC_LEFT_CX, SC_ABBREV_Y, abbrev_font, TEXT_PRIMARY)
-    _draw_centered_text(draw, _team_abbrev(info.team2), SC_RIGHT_CX, SC_ABBREV_Y, abbrev_font, TEXT_PRIMARY)
-    vs_y = SC_FLAG_Y + (SC_FLAG_H - 22) // 2
-    _draw_centered_text(draw, "vs", UPDATE_IMAGE_WIDTH // 2, vs_y, label_font, TEXT_MUTED)
-
-    # Match label line
-    match_info = (
-        f"{info.match_label} \u00b7 {info.series[:45]}"
-        if info.series
-        else info.match_label
+    header_line = (
+        f"{_team_abbrev(info.team1)}  v  {_team_abbrev(info.team2)}"
     )
     _draw_centered_text(
-        draw, match_info[:68], UPDATE_IMAGE_WIDTH // 2, SC_HDR_LABEL_Y, label_font, TEXT_SECONDARY
+        draw, header_line, UPDATE_IMAGE_WIDTH // 2, SC_PREMIUM_TITLE_Y, header_font, SC_PREMIUM_TEXT
     )
-
-    # Batting info zone (team + score)
-    draw.rectangle(
-        [(0, SC_BATTING_INFO_Y), (UPDATE_IMAGE_WIDTH, SC_BATTING_INFO_Y + SC_BATTING_INFO_H)],
-        fill=SC_BATTING_INFO_BG,
-    )
-    ov_part = f"  ({info.overs} ov)" if info.overs else ""
-    batting_text = f"{info.batting_team}  \u2014  {info.score}{ov_part}"
+    series_line = info.series.upper() if info.series else info.match_label.upper()
+    if info.format_tag and info.format_tag not in series_line:
+        series_line = f"{series_line}  {info.format_tag}"
     _draw_centered_text(
         draw,
-        batting_text,
+        series_line[:58],
         UPDATE_IMAGE_WIDTH // 2,
-        SC_BATTING_INFO_Y + (SC_BATTING_INFO_H - 26) // 2,
-        batting_info_font,
-        TEXT_PRIMARY,
+        SC_PREMIUM_SERIES_Y,
+        series_font,
+        SC_PREMIUM_MUTED,
     )
 
-    # Column headers
-    draw.rectangle(
-        [(0, SC_COL_HDR_Y), (UPDATE_IMAGE_WIDTH, SC_COL_HDR_Y + SC_COL_HDR_H)],
-        fill=SC_COL_HEADER_BG,
+    draw.line(
+        [(24, SC_PREMIUM_ROW_START - 8), (UPDATE_IMAGE_WIDTH - 24, SC_PREMIUM_ROW_START - 8)],
+        fill=SC_PREMIUM_ROW_DIVIDER,
+        width=1,
     )
-    col_y = SC_COL_HDR_Y + (SC_COL_HDR_H - 18) // 2
-    draw.text((SC_NAME_X + 4, col_y), "BATTER", font=col_hdr_font, fill=TEXT_MUTED)
-    draw.text((SC_DIS_X, col_y), "HOW OUT", font=col_hdr_font, fill=TEXT_MUTED)
-    _draw_right_text(draw, "R", SC_R_RIGHT, col_y, col_hdr_font, TEXT_MUTED)
-    _draw_right_text(draw, "B", SC_B_RIGHT, col_y, col_hdr_font, TEXT_MUTED)
-    _draw_right_text(draw, "4s", SC_4S_RIGHT, col_y, col_hdr_font, TEXT_MUTED)
-    _draw_right_text(draw, "6s", SC_6S_RIGHT, col_y, col_hdr_font, TEXT_MUTED)
 
-    # Batter rows
-    for i, batter in enumerate(info.batters[:11]):
-        row_y = SC_ROW_START_Y + i * SC_ROW_H
-        if i % 2 == 1:
-            draw.rectangle(
-                [(0, row_y), (UPDATE_IMAGE_WIDTH, row_y + SC_ROW_H)], fill=SC_ROW_ALT_BG
+    top_runs = max((b.runs for b in batters), default=0)
+    overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, img_h), (0, 0, 0, 0))
+
+    for i, batter in enumerate(batters):
+        row_y = SC_PREMIUM_ROW_START + i * SC_PREMIUM_ROW_H
+        if batter.runs == top_runs and top_runs > 0:
+            row_draw = ImageDraw.Draw(overlay)
+            row_draw.rectangle(
+                [(0, row_y), (UPDATE_IMAGE_WIDTH, row_y + SC_PREMIUM_ROW_H)],
+                fill=SC_PREMIUM_TOP_SCORER_BG,
             )
-        # Thin bottom divider
-        draw.line(
-            [(SC_NAME_X, row_y + SC_ROW_H - 1), (UPDATE_IMAGE_WIDTH - SC_NAME_X, row_y + SC_ROW_H - 1)],
-            fill="#E8EAED",
-            width=1,
-        )
-        text_y = row_y + (SC_ROW_H - 24) // 2
-        stat_y = row_y + (SC_ROW_H - 26) // 2
-        mstat_y = row_y + (SC_ROW_H - 21) // 2
+        text_y = row_y + (SC_PREMIUM_ROW_H - 22) // 2
+        stat_y = row_y + (SC_PREMIUM_ROW_H - 24) // 2
+        name_display = _sc_batter_display_name(batter.name)
+        dis_display = _abbrev_dismissal(batter.dismissal)
 
-        # Player name
-        name_display = batter.name[:22]
         if batter.not_out:
             draw.text(
-                (SC_NAME_X, text_y),
-                name_display + "*",
+                (SC_PREMIUM_NAME_X, text_y),
+                name_display,
                 font=name_font_bold,
-                fill=SC_NOT_OUT_COLOR,
+                fill=SC_PREMIUM_NOT_OUT,
+            )
+            draw.text(
+                (SC_PREMIUM_DIS_X, text_y),
+                dis_display,
+                font=dis_font,
+                fill=SC_PREMIUM_NOT_OUT,
             )
         else:
-            draw.text((SC_NAME_X, text_y), name_display, font=name_font_reg, fill=TEXT_PRIMARY)
+            draw.text(
+                (SC_PREMIUM_NAME_X, text_y),
+                name_display,
+                font=name_font_reg,
+                fill=SC_PREMIUM_TEXT,
+            )
+            draw.text(
+                (SC_PREMIUM_DIS_X, text_y),
+                dis_display[:34],
+                font=dis_font,
+                fill=SC_PREMIUM_MUTED,
+            )
 
-        # Dismissal text
-        dis_display = batter.dismissal[:34] if batter.dismissal else "not out"
-        draw.text((SC_DIS_X, text_y + 1), dis_display, font=dis_font, fill=TEXT_MUTED)
+        _draw_right_text(
+            draw, str(batter.runs), SC_PREMIUM_R_RIGHT, stat_y, stat_font, SC_PREMIUM_TEXT
+        )
+        _draw_right_text(
+            draw,
+            str(batter.balls),
+            SC_PREMIUM_B_RIGHT,
+            stat_y,
+            stat_font_reg,
+            SC_PREMIUM_MUTED,
+        )
+        draw.line(
+            [
+                (SC_PREMIUM_NAME_X, row_y + SC_PREMIUM_ROW_H - 1),
+                (UPDATE_IMAGE_WIDTH - SC_PREMIUM_NAME_X, row_y + SC_PREMIUM_ROW_H - 1),
+            ],
+            fill=SC_PREMIUM_ROW_DIVIDER,
+            width=1,
+        )
 
-        # Stats
-        _draw_right_text(draw, str(batter.runs), SC_R_RIGHT, stat_y, r_font, TEXT_PRIMARY)
-        _draw_right_text(draw, str(batter.balls), SC_B_RIGHT, mstat_y, stat_font, TEXT_SECONDARY)
-        _draw_right_text(draw, str(batter.fours), SC_4S_RIGHT, mstat_y, stat_font, TEXT_SECONDARY)
-        _draw_right_text(draw, str(batter.sixes), SC_6S_RIGHT, mstat_y, stat_font, TEXT_SECONDARY)
+    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    draw = ImageDraw.Draw(img)
 
-    # Extras row
-    draw.line([(0, extras_y), (UPDATE_IMAGE_WIDTH, extras_y)], fill="#D0D0D0", width=1)
-    draw.rectangle(
-        [(0, extras_y + 1), (UPDATE_IMAGE_WIDTH, extras_y + SC_EXTRAS_H)],
-        fill=SC_BATTING_INFO_BG,
+    if dnb_text:
+        dnb_y = SC_PREMIUM_ROW_START + num_rows * SC_PREMIUM_ROW_H
+        draw.text(
+            (SC_PREMIUM_NAME_X, dnb_y + (SC_PREMIUM_DNB_H - 18) // 2),
+            dnb_text[:72],
+            font=dnb_font,
+            fill=SC_PREMIUM_MUTED,
+        )
+        draw.line(
+            [(24, dnb_y), (UPDATE_IMAGE_WIDTH - 24, dnb_y)],
+            fill=SC_PREMIUM_ROW_DIVIDER,
+            width=1,
+        )
+
+    draw.line(
+        [(24, footer_y), (UPDATE_IMAGE_WIDTH - 24, footer_y)],
+        fill=SC_PREMIUM_ROW_DIVIDER,
+        width=2,
     )
-    ex_text_y = extras_y + (SC_EXTRAS_H - 21) // 2
-    draw.text((SC_NAME_X, ex_text_y), "Extras", font=extras_font, fill=TEXT_MUTED)
-    if info.extras:
-        draw.text((SC_DIS_X, ex_text_y), info.extras[:42], font=extras_font, fill=TEXT_MUTED)
-    _draw_right_text(draw, str(info.extras_runs), SC_R_RIGHT, ex_text_y, extras_font, TEXT_SECONDARY)
 
-    # Total row
-    draw.line([(0, total_y), (UPDATE_IMAGE_WIDTH, total_y)], fill="#D0D0D0", width=1)
-    tot_name_y = total_y + (SC_TOTAL_H - 22) // 2
-    tot_val_y = total_y + (SC_TOTAL_H - 26) // 2
-    draw.text((SC_NAME_X, tot_name_y), "TOTAL", font=total_name_font, fill=TEXT_PRIMARY)
-    if info.total_detail:
-        draw.text((SC_DIS_X, tot_name_y), info.total_detail[:40], font=extras_font, fill=TEXT_MUTED)
-    _draw_right_text(draw, str(info.total_runs), SC_R_RIGHT, tot_val_y, total_val_font, TEXT_PRIMARY)
-
-    # Footer
-    draw.line([(0, footer_y), (UPDATE_IMAGE_WIDTH, footer_y)], fill="#E0E0E0", width=1)
-    foot_text = (
-        f"{info.match_label} \u00b7 {info.series[:52]}" if info.series else info.match_label
+    overs_label = info.overs or ""
+    if overs_label and not overs_label.lower().endswith("ov"):
+        overs_label = f"{overs_label} ov"
+    extras_label = f"EXTRAS {info.extras_runs}" if info.extras_runs else "EXTRAS"
+    footer_mid_y = footer_y + (SC_PREMIUM_FOOTER_H - 44) // 2
+    draw.text(
+        (SC_PREMIUM_NAME_X, footer_mid_y + 14),
+        f"OVERS {overs_label.upper()}" if overs_label else "",
+        font=footer_label_font,
+        fill=SC_PREMIUM_MUTED,
     )
-    _draw_centered_text(
+    draw.text(
+        (SC_PREMIUM_NAME_X + 280, footer_mid_y + 14),
+        extras_label,
+        font=footer_label_font,
+        fill=SC_PREMIUM_MUTED,
+    )
+    total_display = info.score if info.score else str(info.total_runs)
+    _draw_right_text(
         draw,
-        foot_text[:70],
-        UPDATE_IMAGE_WIDTH // 2,
-        footer_y + (SC_SC_FOOTER_H - 20) // 2,
-        footer_font_sc,
-        TEXT_MUTED,
+        total_display,
+        UPDATE_IMAGE_WIDTH - 28,
+        footer_mid_y,
+        footer_total_font,
+        SC_PREMIUM_TEXT,
     )
 
     return img

@@ -20,6 +20,7 @@ from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 from match_image import (
+    _abbrev_dismissal,
     _extract_time,
     _extract_venue_from_line,
     _load_font,
@@ -53,8 +54,10 @@ from main import (
     PLAYING_XI_AFTER_TOSS_DELAY,
     PLAYING_XI_PENDING_INTERVAL,
     _best_block_for_playing_xi,
+    _first_innings_batting_team,
     _playing_xi_allowed,
     _playing_xi_pending,
+    _should_post_innings_scorecard,
     _teams_from_block_names,
     _toss_announced,
     _toss_xi_delay_remaining,
@@ -1445,12 +1448,39 @@ def test_scorecard_parsing(keep_image: bool = False) -> bool:
         _sc("Caption contains score", "141" in caption, caption[:80])
         _sc("Caption has hashtags", "#ZIMvsBAN" in caption, caption[-100:])
 
-    # --- Image generation ---
+    # --- Image generation (premium dark layout) ---
     if info_combined:
         try:
             img_path = generate_scorecard_image(info_combined)
             img_exists = img_path.exists()
+            img_size = img_path.stat().st_size if img_exists else 0
             _sc("Scorecard image generated", img_exists, str(img_path))
+            if img_exists:
+                from PIL import Image
+
+                with Image.open(img_path) as img:
+                    expected_h = (
+                        168
+                        + 11 * 46
+                        + 96
+                        + 20
+                    )
+                    _sc(
+                        "Premium image height fits 11 rows",
+                        img.height >= expected_h - 10,
+                        f"{img.width}x{img.height}",
+                    )
+                    _sc(
+                        "Premium image size >= 10KB",
+                        img_size >= 10_000,
+                        f"{img_size} bytes",
+                    )
+            _sc(
+                "Dismissal abbrev",
+                _abbrev_dismissal("c Mosaddek Hossain b Taskin Ahmed")
+                == "c MOSADDEK b TASKIN",
+                _abbrev_dismissal("c Mosaddek Hossain b Taskin Ahmed"),
+            )
             if img_exists and not keep_image:
                 try:
                     img_path.unlink()
@@ -1458,6 +1488,72 @@ def test_scorecard_parsing(keep_image: bool = False) -> bool:
                     pass
         except Exception as exc:
             _sc("Scorecard image generated", False, str(exc))
+
+    return all_ok
+
+
+def test_scorecard_trigger_window() -> bool:
+    print("\n=== 4e. Innings Scorecard Trigger Window ===")
+    all_ok = True
+
+    def _tw(label: str, cond: bool, detail: str = "") -> None:
+        nonlocal all_ok
+        _status(label, cond, detail)
+        if not cond:
+            all_ok = False
+
+    state = PostState()
+
+    break_info = parse_match_block(SAMPLE_INNINGS_BREAK_BLOCK.strip(), "live")
+    break_info.match_key = make_match_key(SAMPLE_INNINGS_BREAK_BLOCK.strip())
+    _tw(
+        "Innings break triggers scorecard",
+        _should_post_innings_scorecard(
+            break_info, state, SAMPLE_INNINGS_BREAK_BLOCK.strip()
+        ),
+    )
+    _tw(
+        "First innings team at break",
+        _first_innings_batting_team(break_info) == "Pakistan",
+        _first_innings_batting_team(break_info),
+    )
+
+    chase_info = parse_match_block(SAMPLE_CHASE_BLOCK.strip(), "live")
+    chase_info.match_key = make_match_key(SAMPLE_CHASE_BLOCK.strip())
+    _tw(
+        "Chase triggers scorecard",
+        _should_post_innings_scorecard(chase_info, state, SAMPLE_CHASE_BLOCK.strip()),
+    )
+    _tw(
+        "First innings team during chase",
+        _first_innings_batting_team(chase_info) == "Pakistan",
+        _first_innings_batting_team(chase_info),
+    )
+
+    finished_block = """
+LIVE
+PAK vs IND, 2nd T20I
+Pakistan
+180/7
+India
+(20/20 ov) 181/3
+IND won by 7 wickets
+"""
+    finished_info = parse_match_block(finished_block.strip(), "live")
+    finished_info.match_key = make_match_key(finished_block.strip())
+    _tw(
+        "Result / won-by blocks scorecard",
+        not _should_post_innings_scorecard(finished_info, state, finished_block.strip()),
+    )
+
+    sc_key = f"{break_info.match_key}|{_first_innings_batting_team(break_info)}"
+    state.scorecard_innings_posted.add(sc_key)
+    _tw(
+        "Already posted blocks duplicate",
+        not _should_post_innings_scorecard(
+            break_info, state, SAMPLE_INNINGS_BREAK_BLOCK.strip()
+        ),
+    )
 
     return all_ok
 
@@ -1554,6 +1650,7 @@ async def run(args: argparse.Namespace) -> int:
     playing_xi_retry_ok = test_playing_xi_retry_interval()
     test_session_ok = test_test_session_posting()
     scorecard_ok = test_scorecard_parsing(keep_image=args.match_image)
+    scorecard_trigger_ok = test_scorecard_trigger_window()
     posts_ok = test_rule_based_posts()
     gemini_input = extract_tracked_match_data(raw_data) or raw_data
     post_text = await test_gemini(gemini_input.split("\n\n---\n\n")[0])
@@ -1583,6 +1680,7 @@ async def run(args: argparse.Namespace) -> int:
         and playing_xi_retry_ok
         and test_session_ok
         and scorecard_ok
+        and scorecard_trigger_ok
     )
     if fb_ok and multi_ok and rules_ok and preview_ok and posts_ok:
         if post_text and post_text != "rule-based":

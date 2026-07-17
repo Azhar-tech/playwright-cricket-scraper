@@ -212,6 +212,13 @@ PLAYING_XI_CONTENT_SELECTORS = (
     "[class*='PlayingXi']",
 )
 
+SCORECARD_CONTENT_SELECTORS = (
+    "text=BATTING",
+    "table",
+    "[class*='scorecard']",
+    "[class*='Scorecard']",
+)
+
 
 
 USER_AGENT = (
@@ -875,22 +882,74 @@ async def fetch_playing_xi(
     return {}
 
 
+async def _wait_for_scorecard_content(page: Page) -> bool:
+    """Wait for scorecard page content; ESPN often never reaches networkidle."""
+    per_selector_ms = max(3000, WIDGET_WAIT_TIMEOUT_MS // len(SCORECARD_CONTENT_SELECTORS))
+    for selector in SCORECARD_CONTENT_SELECTORS:
+        try:
+            await page.locator(selector).first.wait_for(
+                state="visible",
+                timeout=per_selector_ms,
+            )
+            return True
+        except PlaywrightTimeoutError:
+            continue
+    return False
+
+
+def _first_innings_batting_team(info: MatchUpdateInfo) -> str:
+    """Team that batted in the first innings (scorecard subject)."""
+    if info.innings_status == "innings_break":
+        return info.batting_team
+    if info.innings_status == "chase":
+        return info.team2 if info.batting_team == info.team1 else info.team1
+    return info.batting_team
+
+
+def _should_post_innings_scorecard(
+    info: MatchUpdateInfo,
+    state: PostState,
+    block: str,
+) -> bool:
+    if block_match_phase(block, state=state) == "result":
+        return False
+    if re.search(r"\bwon by\b", block, re.IGNORECASE):
+        return False
+    first_team = _first_innings_batting_team(info)
+    if not first_team:
+        return False
+    sc_key = f"{info.match_key}|{first_team}"
+    if sc_key in state.scorecard_innings_posted:
+        return False
+    return info.innings_status in ("innings_break", "chase")
+
+
 async def fetch_innings_scorecard(
     page: Page,
     match_url: str,
     info: MatchUpdateInfo,
+    batting_team: str,
 ) -> ScorecardInfo | None:
     """Navigate to the ESPN full-scorecard page and parse the completed innings."""
     if not match_url:
         return None
 
     sc_url = match_url.rstrip("/") + "/full-scorecard"
+    nav_ok = True
     try:
         await page.goto(sc_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-        await page.wait_for_load_state("networkidle", timeout=WIDGET_WAIT_TIMEOUT_MS)
     except PlaywrightTimeoutError:
-        logger.warning("Scorecard page load timed out: %s", sc_url)
-        return None
+        logger.warning("Scorecard navigation timed out: %s", sc_url)
+        nav_ok = False
+
+    if nav_ok:
+        if not await _wait_for_scorecard_content(page):
+            logger.info(
+                "Scorecard content selector not found; trying partial parse: %s",
+                sc_url,
+            )
+    else:
+        logger.info("Trying partial scorecard parse after navigation timeout: %s", sc_url)
 
     await _dismiss_cookie_banner(page)
     await asyncio.sleep(random.uniform(1.5, 3.0))
@@ -901,13 +960,13 @@ async def fetch_innings_scorecard(
         logger.warning("Could not read scorecard page body: %s", sc_url)
         return None
 
-    score = info.score1 if info.batting_team == info.team1 else info.score2
-    overs_raw = info.overs1 if info.batting_team == info.team1 else info.overs2
+    score = info.score1 if batting_team == info.team1 else info.score2
+    overs_raw = info.overs1 if batting_team == info.team1 else info.overs2
     overs = overs_raw.strip("()") if overs_raw else ""
 
     return parse_innings_scorecard_text(
         body_text=body_text,
-        batting_team=info.batting_team,
+        batting_team=batting_team,
         team1=info.team1,
         team2=info.team2,
         score=score,
@@ -916,6 +975,105 @@ async def fetch_innings_scorecard(
         series=info.series,
         format_tag=info.format_tag,
     )
+
+
+async def _publish_innings_scorecard(
+    page: Page,
+    match_url: str,
+    update_info: MatchUpdateInfo,
+    match_key: str,
+    config: dict[str, str],
+    state: PostState,
+) -> bool:
+    """Fetch and post the first-innings scorecard once per match."""
+    first_team = _first_innings_batting_team(update_info)
+    sc_key = f"{match_key}|{first_team}"
+    if sc_key in state.scorecard_innings_posted:
+        return False
+
+    try:
+        sc_info = await fetch_innings_scorecard(
+            page, match_url, update_info, first_team
+        )
+        if not sc_info or not sc_info.batters:
+            logger.warning("Scorecard parse returned no batters for %s", sc_key)
+            return False
+
+        sc_image = generate_scorecard_image(sc_info)
+        sc_text = build_scorecard_caption(sc_info)
+        sc_published = publish_photo_to_facebook(
+            sc_text,
+            sc_image,
+            config["FACEBOOK_PAGE_ID"],
+            config["FACEBOOK_ACCESS_TOKEN"],
+        )
+        if sc_published:
+            try:
+                sc_image.unlink(missing_ok=True)
+            except OSError:
+                pass
+            state.scorecard_innings_posted.add(sc_key)
+            save_post_state(state)
+            logger.info("Posted innings scorecard for %s", sc_key)
+            return True
+
+        logger.warning("Scorecard post failed (Facebook error) for %s", sc_key)
+    except Exception as exc:
+        logger.error("Scorecard post error for %s: %s", sc_key, exc)
+    return False
+
+
+async def post_missed_innings_scorecard(
+    raw_data: str,
+    match_links: dict[str, str],
+    page: Page,
+    config: dict[str, str],
+    state: PostState,
+    *,
+    posted_count: int = 0,
+    scorecard_attempted: set[str] | None = None,
+) -> int:
+    """Catch-up post for first-innings scorecard during break or chase."""
+    attempted = scorecard_attempted if scorecard_attempted is not None else set()
+    blocks_by_key: dict[str, list[str]] = {}
+    for block in normalize_match_blocks(raw_data):
+        if not block_has_tracked_team(block):
+            continue
+        blocks_by_key.setdefault(make_match_key(block), []).append(block)
+
+    for match_key, blocks in blocks_by_key.items():
+        if match_key in attempted:
+            continue
+        if detect_format(blocks[0]) not in ("T20", "ODI"):
+            continue
+
+        live_block = next(
+            (block for block in blocks if block_match_phase(block, state=state) == "live"),
+            None,
+        )
+        if not live_block:
+            continue
+
+        update_info = parse_match_block(live_block, "live")
+        update_info.match_key = match_key
+        if not _should_post_innings_scorecard(update_info, state, live_block):
+            continue
+
+        match_url = _resolve_match_url(match_key, match_links)
+        if not match_url:
+            continue
+
+        if posted_count > 0:
+            logger.info("Waiting %ds before missed innings scorecard post", INTER_MATCH_POST_DELAY)
+            await asyncio.sleep(INTER_MATCH_POST_DELAY)
+
+        if await _publish_innings_scorecard(
+            page, match_url, update_info, match_key, config, state
+        ):
+            posted_count += 1
+        attempted.add(match_key)
+
+    return posted_count
 
 
 def _resolve_match_url(match_key: str, match_links: dict[str, str]) -> str:
@@ -1865,6 +2023,7 @@ async def run_cycle(
         logger.info("Found %d tracked fixture(s)", len(candidates))
         posted_count = 0
         xi_attempted: set[str] = set()
+        scorecard_attempted: set[str] = set()
 
         for block, phase in candidates:
             match_key = make_match_key(block)
@@ -1988,46 +2147,19 @@ async def run_cycle(
                 )
                 xi_attempted.add(match_key)
 
-            if phase == "live" and innings_break and match_fmt in ("T20", "ODI"):
-                sc_key = f"{match_key}|{update_info.batting_team}"
-                if sc_key not in _post_state.scorecard_innings_posted:
-                    match_url = _resolve_match_url(match_key, match_links)
-                    if match_url:
-                        try:
-                            sc_info = await fetch_innings_scorecard(
-                                page, match_url, update_info
-                            )
-                            if sc_info and sc_info.batters:
-                                sc_image = generate_scorecard_image(sc_info)
-                                sc_text = build_scorecard_caption(sc_info)
-                                await asyncio.sleep(INTER_MATCH_POST_DELAY)
-                                sc_published = publish_photo_to_facebook(
-                                    sc_text,
-                                    sc_image,
-                                    config["FACEBOOK_PAGE_ID"],
-                                    config["FACEBOOK_ACCESS_TOKEN"],
-                                )
-                                if sc_published:
-                                    try:
-                                        sc_image.unlink(missing_ok=True)
-                                    except OSError:
-                                        pass
-                                    _post_state.scorecard_innings_posted.add(sc_key)
-                                    save_post_state(_post_state)
-                                    posted_count += 1
-                                    logger.info("Posted innings scorecard for %s", sc_key)
-                                else:
-                                    logger.warning(
-                                        "Scorecard post failed (Facebook error) for %s", sc_key
-                                    )
-                            else:
-                                logger.warning(
-                                    "Scorecard parse returned no batters for %s", sc_key
-                                )
-                        except Exception as exc:
-                            logger.error(
-                                "Scorecard post error for %s: %s", sc_key, exc
-                            )
+            if (
+                phase == "live"
+                and match_fmt in ("T20", "ODI")
+                and _should_post_innings_scorecard(update_info, _post_state, block)
+            ):
+                match_url = _resolve_match_url(match_key, match_links)
+                if match_url:
+                    await asyncio.sleep(INTER_MATCH_POST_DELAY)
+                    if await _publish_innings_scorecard(
+                        page, match_url, update_info, match_key, config, _post_state
+                    ):
+                        posted_count += 1
+                scorecard_attempted.add(match_key)
 
         posted_count = await post_missed_toss_and_playing_xi(
             raw_data,
@@ -2037,6 +2169,16 @@ async def run_cycle(
             _post_state,
             posted_count=posted_count,
             xi_attempted=xi_attempted,
+        )
+
+        posted_count = await post_missed_innings_scorecard(
+            raw_data,
+            match_links,
+            page,
+            config,
+            _post_state,
+            posted_count=posted_count,
+            scorecard_attempted=scorecard_attempted,
         )
 
         if posted_count == 0:
