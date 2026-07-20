@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -75,6 +76,10 @@ TEAM_SLUGS: dict[str, str] = {
 
 MATCH_LABEL_PATTERN = re.compile(
     r"\d+(?:st|nd|rd|th)\s+(?:T20I?|ODI|One\s*Day|Test)(?:\s*\([^)]+\))?",
+    re.IGNORECASE,
+)
+PRACTICE_FIXTURE_PATTERN = re.compile(
+    r"\b(?:tour\s+match|practice\s+(?:test\s+)?match|warm[-\s]?up(?:\s+match)?|unofficial\s+test)\b",
     re.IGNORECASE,
 )
 TIME_PATTERN = re.compile(r"\d{1,2}:\d{2}\s*(?:AM|PM)", re.IGNORECASE)
@@ -457,6 +462,15 @@ def _normalize_team_name(line: str) -> str:
                 return f"{team} Women"
             return team
     return line.strip()
+
+
+def is_excluded_fixture(block: str) -> bool:
+    """Practice / warm-up tour matches — not official numbered internationals."""
+    if not PRACTICE_FIXTURE_PATTERN.search(block):
+        return False
+    if MATCH_LABEL_PATTERN.search(block):
+        return False
+    return True
 
 
 def _detect_format(text: str) -> str:
@@ -2163,7 +2177,7 @@ def _draw_compact_update_card(info: MatchUpdateInfo) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 _SC_STATS_TAIL = re.compile(
-    r"\s+(\d+)\s+(\d+)\s+\d+\s+(\d+)\s+(\d+)\s+[\d.]+\s*$"
+    r"(?:\s+|^)(\d+)\s+(\d+)\s+\d+\s+(\d+)\s+(\d+)\s+[\d.]+\s*$"
 )
 _SC_DISMISSAL_KW = re.compile(
     r"\b(c\s+(?!\d)|lbw\s+b\s|lbw\b|b\s+(?=[A-Z])|run\s+out|not\s+out|st\s+|retired\s+)",
@@ -2173,7 +2187,426 @@ _SC_SKIP_LINE = re.compile(
     r"^\d|fall\s+of\s+wickets|^batting$|^bowling$|overs?\s*\(|\bRR:",
     re.IGNORECASE,
 )
-_SC_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z\s.\'\u2019\-()†]+$")
+_SC_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z\s.\'\u2019\-()†&]+$")
+_SC_UI_SKIP = re.compile(
+    r"^(?:match\s+flow|info|scorecard|squad|commentary|overs|fall\s+of\s+wickets|"
+    r"england\s+innings|india\s+innings|australia\s+innings|pakistan\s+innings|"
+    r"bangladesh\s+innings|sri\s+lanka\s+innings|new\s+zealand\s+innings|"
+    r"south\s+africa\s+innings|west\s+indies\s+innings|afghanistan\s+innings|"
+    r"ireland\s+innings|zimbabwe\s+innings|.*\s+innings)$",
+    re.IGNORECASE,
+)
+_SC_UI_TOKENS = frozenset(
+    {"innings", "flow", "info", "batting", "total", "extras", "scorecard", "squad", "commentary"}
+)
+
+
+def _sc_clean_player_name(raw: str) -> str:
+    """Strip keeper dagger and captain markers from a player name."""
+    clean = re.sub(r"\s*†\s*$", "", raw)
+    clean = re.sub(r"\s*\([vc]+\)\s*$", "", clean)
+    return clean.strip()
+
+
+def _sc_team_name_matches(candidate: str, team: str) -> bool:
+    if not candidate or not team:
+        return False
+    c = candidate.replace(" Women", "").strip().lower()
+    t = team.replace(" Women", "").strip().lower()
+    return c == t or t in c or c in t
+
+
+def _sc_looks_like_player_name(line: str) -> bool:
+    clean = _sc_clean_player_name(line.strip())
+    if not clean or len(clean) < 3:
+        return False
+    if _SC_UI_SKIP.search(clean):
+        return False
+    lower = clean.lower()
+    if lower in _SC_UI_TOKENS:
+        return False
+    if " innings" in lower or lower.endswith(" innings"):
+        return False
+    words = clean.split()
+    if len(words) < 2:
+        return False
+    if not all(w[0].isalpha() and w[0].isupper() for w in words[:2] if w):
+        return False
+    return bool(_SC_NAME_RE.match(clean))
+
+
+def scorecard_parse_valid(info: ScorecardInfo) -> bool:
+    """Reject parsed scorecards with UI junk or too few batters."""
+    if len(info.batters) < 3:
+        return False
+    for batter in info.batters:
+        name_lower = batter.name.strip().lower()
+        if name_lower in _SC_UI_TOKENS:
+            return False
+        if " innings" in name_lower or name_lower.endswith(" flow"):
+            return False
+        last_word = name_lower.split()[-1] if name_lower.split() else ""
+        if last_word in _SC_UI_TOKENS:
+            return False
+    return True
+
+
+def _sc_trim_post_batting(post_batting: str, batting_team: str, team1: str, team2: str) -> str:
+    other = team2 if _sc_team_name_matches(batting_team, team1) else team1
+    end = re.search(rf"\b{re.escape(other)}\s*Innings\b", post_batting, re.IGNORECASE)
+    if end:
+        return post_batting[: end.start()]
+    return post_batting
+
+
+def _sc_parse_multiline_rows(rows_text: str) -> list[ScorecardBatter]:
+    """Parse ESPN modern layout: name, dismissal, and stats on separate lines."""
+    lines = [line.strip() for line in rows_text.splitlines() if line.strip()]
+    batters: list[ScorecardBatter] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"^(BATTING|R\s+B\s+M)", line, re.IGNORECASE):
+            i += 1
+            continue
+        if re.match(r"^Extras\b", line, re.IGNORECASE) or re.match(r"^Total\b", line, re.IGNORECASE):
+            break
+
+        one_line = _sc_parse_batter_line(line)
+        if one_line and _sc_looks_like_player_name(one_line.name):
+            batters.append(one_line)
+            i += 1
+            continue
+
+        if not _sc_looks_like_player_name(line):
+            i += 1
+            continue
+
+        name = _sc_clean_player_name(line)
+        dismissal = ""
+        j = i + 1
+        if j < len(lines):
+            nxt = lines[j]
+            if _SC_STATS_TAIL.search(nxt):
+                combined = f"{name} not out {nxt}" if "not out" not in nxt.lower() else f"{name} {nxt}"
+                parsed = _sc_parse_batter_line(combined) or _sc_parse_name_stats(name, nxt)
+                if parsed:
+                    batters.append(parsed)
+                i = j + 1
+                continue
+            if _SC_DISMISSAL_KW.search(nxt) or nxt.lower().startswith(
+                ("c ", "b ", "lbw", "run out", "st ", "not out")
+            ):
+                dismissal = nxt
+                j += 1
+        if j < len(lines) and _SC_STATS_TAIL.search(lines[j]):
+            stats_line = lines[j]
+            if dismissal:
+                parsed = _sc_parse_name_stats(name, f"{dismissal} {stats_line}")
+            else:
+                parsed = _sc_parse_batter_line(f"{name} {stats_line}")
+            if parsed:
+                batters.append(parsed)
+            i = j + 1
+            continue
+        i += 1
+    return batters
+
+
+def _sc_batter_from_json_obj(raw: dict) -> ScorecardBatter | None:
+    player = raw.get("player") or raw.get("batsman") or {}
+    if isinstance(player, str):
+        name = player
+    else:
+        name = player.get("name") or player.get("longName") or player.get("fieldingName") or ""
+    if not name:
+        name = raw.get("name") or raw.get("playerName") or ""
+    if not name:
+        return None
+
+    batted_type = str(raw.get("battedType") or raw.get("batted") or "").lower()
+    batted = batted_type not in ("", "dnb", "didnotbat", "did not bat")
+    is_out = raw.get("isOut")
+    if is_out is None:
+        is_out = raw.get("out", True)
+    dismissal_obj = raw.get("dismissalText") or raw.get("dismissal") or {}
+    if isinstance(dismissal_obj, dict):
+        dismissal = dismissal_obj.get("long") or dismissal_obj.get("short") or ""
+    else:
+        dismissal = str(dismissal_obj or "")
+    if not batted:
+        return None
+    if not dismissal:
+        dismissal = "not out" if not is_out else "out"
+    not_out = not is_out or bool(re.search(r"\bnot\s+out\b", dismissal, re.IGNORECASE))
+
+    def _int_field(*keys: str) -> int:
+        for key in keys:
+            val = raw.get(key)
+            if val is not None and str(val).strip() != "":
+                try:
+                    return int(float(val))
+                except (TypeError, ValueError):
+                    continue
+        return 0
+
+    return ScorecardBatter(
+        name=str(name).strip(),
+        dismissal=str(dismissal).strip(),
+        runs=_int_field("runs", "r"),
+        balls=_int_field("balls", "b"),
+        fours=_int_field("fours", "4s"),
+        sixes=_int_field("sixes", "6s"),
+        not_out=not_out,
+    )
+
+
+def _sc_walk_for_innings(obj, found: list) -> None:
+    if isinstance(obj, dict):
+        if "inningBatsmen" in obj and isinstance(obj["inningBatsmen"], list):
+            found.append(obj)
+        for key in ("innings", "scorecard", "content", "pageData", "data"):
+            if key in obj:
+                _sc_walk_for_innings(obj[key], found)
+        for value in obj.values():
+            if isinstance(value, (dict, list)):
+                _sc_walk_for_innings(value, found)
+    elif isinstance(obj, list):
+        for item in obj:
+            _sc_walk_for_innings(item, found)
+
+
+def _sc_innings_team_name(innings_obj: dict) -> str:
+    for key in ("team", "battingTeam", "teamName", "inningTeam"):
+        val = innings_obj.get(key)
+        if isinstance(val, dict):
+            val = val.get("name") or val.get("teamName")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _sc_extras_from_innings(innings_obj: dict) -> tuple[str, int]:
+    extras = innings_obj.get("extras") or innings_obj.get("inningExtras") or {}
+    if isinstance(extras, dict):
+        total = extras.get("total") or extras.get("runs") or extras.get("extraRuns")
+        parts = []
+        for label, key in (("lb", "byes"), ("nb", "noBalls"), ("w", "wides"), ("p", "penalties")):
+            val = extras.get(key) or extras.get(label)
+            if val:
+                parts.append(f"{label} {val}")
+        detail = ", ".join(parts)
+        runs = 0
+        if total is not None:
+            try:
+                runs = int(total)
+            except (TypeError, ValueError):
+                runs = 0
+        extras_str = f"({detail})  {runs}" if detail else str(runs)
+        return extras_str, runs
+    if isinstance(extras, (int, float)):
+        return str(int(extras)), int(extras)
+    return "", 0
+
+
+def _sc_total_from_innings(innings_obj: dict, score: str) -> tuple[int, str]:
+    total_obj = innings_obj.get("total") or innings_obj.get("runs") or {}
+    total_runs = 0
+    total_detail = ""
+    if isinstance(total_obj, dict):
+        total_runs = int(total_obj.get("runs") or total_obj.get("total") or 0)
+        overs = total_obj.get("overs") or total_obj.get("over")
+        rr = total_obj.get("runRate") or total_obj.get("rr")
+        if overs:
+            total_detail = f"({overs} Ov" + (f", RR: {rr})" if rr else ")")
+    elif isinstance(total_obj, (int, float)):
+        total_runs = int(total_obj)
+    if not total_runs and score:
+        num_m = re.match(r"(\d+)", score)
+        if num_m:
+            total_runs = int(num_m.group(1))
+    wickets = innings_obj.get("wickets")
+    if wickets is not None and score and "/" not in score and total_runs:
+        score = f"{total_runs}/{wickets}"
+    return total_runs, total_detail
+
+
+def parse_innings_scorecard_from_html(
+    html: str,
+    batting_team: str,
+    team1: str,
+    team2: str,
+    score: str,
+    overs: str,
+    match_label: str,
+    series: str,
+    format_tag: str,
+) -> ScorecardInfo | None:
+    """Parse innings scorecard from ESPN __NEXT_DATA__ JSON embedded in HTML."""
+    match = re.search(
+        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+    innings_blocks: list[dict] = []
+    _sc_walk_for_innings(data, innings_blocks)
+
+    # Also try direct path used by ESPN scorecard pages
+    page_props = data.get("props", {}).get("pageProps", {})
+    for container_key in ("data", "dehydratedState"):
+        container = page_props.get(container_key, {})
+        if not isinstance(container, dict):
+            continue
+        page_data = container.get("pageData") or container.get("data") or container
+        if isinstance(page_data, dict):
+            content = page_data.get("content") or page_data
+            scorecard = content.get("scorecard") if isinstance(content, dict) else None
+            if isinstance(scorecard, dict):
+                innings_raw = scorecard.get("innings")
+                if isinstance(innings_raw, dict):
+                    for inn in innings_raw.values():
+                        if isinstance(inn, dict) and "inningBatsmen" in inn:
+                            innings_blocks.append(inn)
+                elif isinstance(innings_raw, list):
+                    innings_blocks.extend(i for i in innings_raw if isinstance(i, dict))
+
+    seen_ids: set[int] = set()
+    unique_blocks: list[dict] = []
+    for block in innings_blocks:
+        block_id = id(block)
+        if block_id not in seen_ids:
+            seen_ids.add(block_id)
+            unique_blocks.append(block)
+
+    target_innings: dict | None = None
+    for inn in unique_blocks:
+        team_name = _sc_innings_team_name(inn)
+        if _sc_team_name_matches(team_name, batting_team):
+            target_innings = inn
+            break
+
+    # Fallback: first innings block when team name missing from JSON
+    if target_innings is None and unique_blocks:
+        if batting_team == team1 or len(unique_blocks) == 1:
+            target_innings = unique_blocks[0]
+        elif len(unique_blocks) >= 2:
+            target_innings = unique_blocks[0]
+
+    if not target_innings:
+        return None
+
+    batsmen_raw = target_innings.get("inningBatsmen") or target_innings.get("batsmen") or []
+    batters: list[ScorecardBatter] = []
+    squad_names: list[str] = []
+    for raw in batsmen_raw:
+        if not isinstance(raw, dict):
+            continue
+        player = raw.get("player") or raw.get("batsman") or {}
+        if isinstance(player, dict):
+            pname = player.get("name") or player.get("longName") or ""
+            if pname:
+                squad_names.append(str(pname))
+        batter = _sc_batter_from_json_obj(raw)
+        if batter:
+            batters.append(batter)
+
+    if len(batters) < 3:
+        return None
+
+    extras_str, extras_runs = _sc_extras_from_innings(target_innings)
+    total_runs, total_detail = _sc_total_from_innings(target_innings, score)
+    if not total_detail and overs:
+        total_detail = f"({overs} ov)"
+
+    return ScorecardInfo(
+        team1=team1,
+        team2=team2,
+        batting_team=batting_team,
+        score=score,
+        overs=overs,
+        match_label=match_label,
+        series=series,
+        format_tag=format_tag,
+        batters=batters,
+        squad_names=squad_names,
+        extras=extras_str,
+        extras_runs=extras_runs,
+        total_runs=total_runs,
+        total_detail=total_detail,
+    )
+
+
+def _sc_build_scorecard_info(
+    batters: list[ScorecardBatter],
+    *,
+    team1: str,
+    team2: str,
+    batting_team: str,
+    score: str,
+    overs: str,
+    match_label: str,
+    series: str,
+    format_tag: str,
+    squad_names: list[str],
+    post_batting: str,
+) -> ScorecardInfo:
+    extras_m = re.search(r"^Extras\b", post_batting, re.IGNORECASE | re.MULTILINE)
+    total_m = re.search(r"^Total\b", post_batting, re.IGNORECASE | re.MULTILINE)
+    extras_str = ""
+    extras_runs = 0
+    if extras_m:
+        ex_line = post_batting[extras_m.start() : extras_m.start() + 200]
+        ex_detail = re.search(r"\(([^)]+)\)", ex_line)
+        ex_num = re.search(r"\)\s*(\d+)", ex_line)
+        if not ex_num:
+            ex_num = re.search(r"Extras\s+\S*\s+(\d+)", ex_line, re.IGNORECASE)
+        if ex_num:
+            extras_runs = int(ex_num.group(1))
+        extras_str = (
+            f"({ex_detail.group(1)})  {extras_runs}" if ex_detail else str(extras_runs)
+        )
+
+    total_runs = 0
+    total_detail = ""
+    if total_m:
+        t_line = post_batting[total_m.start() : total_m.start() + 150]
+        t_num = re.search(r"Total\s+(\d+)", t_line, re.IGNORECASE)
+        if t_num:
+            total_runs = int(t_num.group(1))
+        t_ov = re.search(r"\(([^)]+(?:Ov|ov)[^)]*)\)", t_line)
+        if t_ov:
+            total_detail = f"({t_ov.group(1)})"
+    if not total_runs and score:
+        num_m = re.match(r"(\d+)", score)
+        if num_m:
+            total_runs = int(num_m.group(1))
+    if not total_detail and overs:
+        total_detail = f"({overs} ov)"
+
+    return ScorecardInfo(
+        team1=team1,
+        team2=team2,
+        batting_team=batting_team,
+        score=score,
+        overs=overs,
+        match_label=match_label,
+        series=series,
+        format_tag=format_tag,
+        batters=batters,
+        squad_names=squad_names,
+        extras=extras_str,
+        extras_runs=extras_runs,
+        total_runs=total_runs,
+        total_detail=total_detail,
+    )
 
 
 def _sc_parse_batter_line(line: str) -> ScorecardBatter | None:
@@ -2229,13 +2662,6 @@ def _sc_parse_name_stats(name: str, dis_stats_line: str) -> ScorecardBatter | No
     )
 
 
-def _sc_clean_player_name(raw: str) -> str:
-    """Strip keeper dagger and captain markers from a player name."""
-    clean = re.sub(r"\s*†\s*$", "", raw)
-    clean = re.sub(r"\s*\([vc]+\)\s*$", "", clean)
-    return clean.strip()
-
-
 def parse_innings_scorecard_text(
     body_text: str,
     batting_team: str,
@@ -2275,9 +2701,8 @@ def parse_innings_scorecard_text(
         return None
 
     pre_batting = section[: bat_hdr.start()]
-    post_batting = section[bat_hdr.end() :]
+    post_batting = _sc_trim_post_batting(section[bat_hdr.end() :], batting_team, team1, team2)
 
-    # Extract player names from the pre-BATTING section (the team's lineup list)
     player_names: list[str] = []
     for raw_line in pre_batting.splitlines():
         raw_line = raw_line.strip()
@@ -2287,29 +2712,31 @@ def parse_innings_scorecard_text(
             continue
         if raw_line.lower().startswith(batting_team.lower()[:6]):
             continue
-        if _SC_NAME_RE.match(raw_line):
+        if _sc_looks_like_player_name(raw_line):
             clean = _sc_clean_player_name(raw_line)
             if clean and clean not in player_names:
                 player_names.append(clean)
 
-    # Locate Extras and Total rows
     extras_m = re.search(r"^Extras\b", post_batting, re.IGNORECASE | re.MULTILINE)
-    total_m = re.search(r"^Total\b", post_batting, re.IGNORECASE | re.MULTILINE)
     rows_end = extras_m.start() if extras_m else min(len(post_batting), 2500)
     rows_text = post_batting[:rows_end]
 
-    # Strategy 1: parse complete lines (name + dismissal + stats on one line)
     batters: list[ScorecardBatter] = []
     for line in rows_text.splitlines():
         line = line.strip()
         if not line or re.match(r"^(BATTING|R\s+B\s+M)", line, re.IGNORECASE):
             continue
         batter = _sc_parse_batter_line(line)
-        if batter and batter.name:
+        if batter and _sc_looks_like_player_name(batter.name):
             batters.append(batter)
 
-    # Strategy 2: fallback — zip pre-BATTING names with dismissal+stats rows
-    if len(batters) < 3 and len(player_names) >= 3:
+    if len(batters) < 3:
+        multiline = _sc_parse_multiline_rows(rows_text)
+        if len(multiline) > len(batters):
+            batters = multiline
+
+    valid_names = [n for n in player_names if _sc_looks_like_player_name(n)]
+    if len(batters) < 3 and len(valid_names) >= 5:
         dis_lines: list[str] = []
         for line in rows_text.splitlines():
             line = line.strip()
@@ -2317,47 +2744,20 @@ def parse_innings_scorecard_text(
                 continue
             if _SC_STATS_TAIL.search(line):
                 dis_lines.append(line)
-        if dis_lines and player_names:
-            batters = []
-            for name, dl in zip(player_names[:11], dis_lines[:11]):
+        if dis_lines:
+            zipped: list[ScorecardBatter] = []
+            for name, dl in zip(valid_names[:11], dis_lines[:11]):
                 b = _sc_parse_name_stats(name, dl)
                 if b:
-                    batters.append(b)
+                    zipped.append(b)
+            if len(zipped) > len(batters):
+                batters = zipped
 
-    # Parse Extras
-    extras_str = ""
-    extras_runs = 0
-    if extras_m:
-        ex_line = post_batting[extras_m.start() : extras_m.start() + 200]
-        ex_detail = re.search(r"\(([^)]+)\)", ex_line)
-        ex_num = re.search(r"\)\s*(\d+)", ex_line)
-        if not ex_num:
-            ex_num = re.search(r"Extras\s+\S*\s+(\d+)", ex_line, re.IGNORECASE)
-        if ex_num:
-            extras_runs = int(ex_num.group(1))
-        extras_str = (
-            f"({ex_detail.group(1)})  {extras_runs}" if ex_detail else str(extras_runs)
-        )
+    if not batters:
+        return None
 
-    # Parse Total
-    total_runs = 0
-    total_detail = ""
-    if total_m:
-        t_line = post_batting[total_m.start() : total_m.start() + 150]
-        t_num = re.search(r"Total\s+(\d+)", t_line, re.IGNORECASE)
-        if t_num:
-            total_runs = int(t_num.group(1))
-        t_ov = re.search(r"\(([^)]+(?:Ov|ov)[^)]*)\)", t_line)
-        if t_ov:
-            total_detail = f"({t_ov.group(1)})"
-    if not total_runs and score:
-        num_m = re.match(r"(\d+)", score)
-        if num_m:
-            total_runs = int(num_m.group(1))
-    if not total_detail and overs:
-        total_detail = f"({overs} ov)"
-
-    return ScorecardInfo(
+    return _sc_build_scorecard_info(
+        batters,
         team1=team1,
         team2=team2,
         batting_team=batting_team,
@@ -2366,12 +2766,8 @@ def parse_innings_scorecard_text(
         match_label=match_label,
         series=series,
         format_tag=format_tag,
-        batters=batters,
         squad_names=player_names,
-        extras=extras_str,
-        extras_runs=extras_runs,
-        total_runs=total_runs,
-        total_detail=total_detail,
+        post_batting=post_batting,
     )
 
 

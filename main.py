@@ -95,11 +95,14 @@ from match_image import (
     generate_match_image,
     generate_preview_image,
     generate_scorecard_image,
+    is_excluded_fixture,
     make_live_signature,
     parse_innings_scorecard_text,
+    parse_innings_scorecard_from_html,
     parse_match_block,
     parse_match_date_from_block,
     parse_preview_block,
+    scorecard_parse_valid,
 )
 from playing_xi import (
     PlayingXiPlayer,
@@ -1014,17 +1017,20 @@ async def fetch_innings_scorecard(
     await asyncio.sleep(random.uniform(1.5, 3.0))
 
     try:
-        body_text = await page.locator("body").inner_text(timeout=10000)
-    except PlaywrightTimeoutError:
-        logger.warning("Could not read scorecard page body: %s", sc_url)
-        return None
+        tab = page.get_by_role(
+            "tab",
+            name=re.compile(rf"{re.escape(batting_team)}.*Innings", re.IGNORECASE),
+        )
+        if await tab.count() > 0:
+            await tab.first.click(timeout=5000)
+            await asyncio.sleep(random.uniform(0.8, 1.5))
+    except (PlaywrightTimeoutError, Exception):
+        logger.info("Scorecard innings tab click skipped for %s", batting_team)
 
     score = info.score1 if batting_team == info.team1 else info.score2
     overs_raw = info.overs1 if batting_team == info.team1 else info.overs2
     overs = overs_raw.strip("()") if overs_raw else ""
-
-    return parse_innings_scorecard_text(
-        body_text=body_text,
+    common = dict(
         batting_team=batting_team,
         team1=info.team1,
         team2=info.team2,
@@ -1034,6 +1040,32 @@ async def fetch_innings_scorecard(
         series=info.series,
         format_tag=info.format_tag,
     )
+
+    try:
+        html = await page.content()
+        sc_info = parse_innings_scorecard_from_html(html, **common)
+        if sc_info and scorecard_parse_valid(sc_info):
+            logger.info("Scorecard parsed from __NEXT_DATA__ for %s", batting_team)
+            return sc_info
+    except Exception as exc:
+        logger.info("Scorecard JSON parse failed for %s: %s", batting_team, exc)
+
+    try:
+        body_text = await page.locator("body").inner_text(timeout=10000)
+    except PlaywrightTimeoutError:
+        logger.warning("Could not read scorecard page body: %s", sc_url)
+        return None
+
+    sc_info = parse_innings_scorecard_text(body_text=body_text, **common)
+    if sc_info and scorecard_parse_valid(sc_info):
+        return sc_info
+    if sc_info:
+        logger.warning(
+            "Scorecard text parse failed validation for %s (%d batters)",
+            batting_team,
+            len(sc_info.batters),
+        )
+    return None
 
 
 async def _publish_innings_scorecard(
@@ -1056,6 +1088,13 @@ async def _publish_innings_scorecard(
         )
         if not sc_info or not sc_info.batters:
             logger.warning("Scorecard parse returned no batters for %s", sc_key)
+            return False
+        if not scorecard_parse_valid(sc_info):
+            logger.warning(
+                "Scorecard parse failed validation for %s (%s)",
+                sc_key,
+                ", ".join(b.name for b in sc_info.batters[:5]),
+            )
             return False
 
         sc_image = generate_scorecard_image(sc_info)
@@ -1096,7 +1135,7 @@ async def post_missed_innings_scorecard(
     attempted = scorecard_attempted if scorecard_attempted is not None else set()
     blocks_by_key: dict[str, list[str]] = {}
     for block in normalize_match_blocks(raw_data):
-        if not block_has_tracked_team(block):
+        if not _eligible_tracked_block(block):
             continue
         blocks_by_key.setdefault(make_match_key(block), []).append(block)
 
@@ -1373,7 +1412,7 @@ async def post_missed_toss_and_playing_xi(
     attempted = xi_attempted if xi_attempted is not None else set()
     blocks_by_key: dict[str, list[str]] = {}
     for block in normalize_match_blocks(raw_data):
-        if not block_has_tracked_team(block):
+        if not _eligible_tracked_block(block):
             continue
         blocks_by_key.setdefault(make_match_key(block), []).append(block)
 
@@ -1493,6 +1532,10 @@ def split_espn_match_blocks(text: str) -> list[str]:
 
 def block_has_tracked_team(block: str) -> bool:
     return any(_line_is_tracked_team(line) for line in block.splitlines())
+
+
+def _eligible_tracked_block(block: str) -> bool:
+    return block_has_tracked_team(block) and not is_excluded_fixture(block)
 
 
 def split_preview_fixture_blocks(text: str) -> list[str]:
@@ -1630,6 +1673,9 @@ def block_match_phase(block: str, state: PostState | None = None) -> str:
 def is_postable_block(block: str, state: PostState | None = None) -> bool:
     """Tracked national-team fixtures: live, finished, toss, or today's preview."""
     if not block_has_tracked_team(block):
+        return False
+    if is_excluded_fixture(block):
+        logger.info("Skipping practice/tour fixture")
         return False
     if "NOT COVERED LIVE" in block.upper():
         return False
@@ -1860,7 +1906,7 @@ def get_xi_pending_sleep_interval(text: str, state: PostState) -> int | None:
     """Shorter retry when toss is posted but Playing XI squads are still pending."""
     blocks_by_key: dict[str, list[str]] = {}
     for block in normalize_match_blocks(text):
-        if not block_has_tracked_team(block):
+        if not _eligible_tracked_block(block):
             continue
         blocks_by_key.setdefault(make_match_key(block), []).append(block)
 

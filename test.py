@@ -37,6 +37,8 @@ from match_image import (
     parse_innings_scorecard_text,
     parse_match_block,
     parse_preview_block,
+    scorecard_parse_valid,
+    is_excluded_fixture,
 )
 from playing_xi import (
     build_playing_xi_caption,
@@ -69,6 +71,7 @@ from main import (
     generate_post,
     get_sleep_interval,
     get_xi_pending_sleep_interval,
+    is_postable_block,
     is_tracked_match,
     make_match_key,
     make_preview_key,
@@ -163,6 +166,15 @@ West Indies
 245/3
 Sri Lanka
 West Indies won the toss and elected to bat
+"""
+
+SAMPLE_PAK_WI_TOUR_MATCH = """
+LIVE
+Pakistan tour of West Indies 2026
+Tour Match, Tarouba, July 18 - 21, 2026
+Pakistan
+184/2
+West Indies
 """
 
 SAMPLE_TEST_LUNCH = """
@@ -300,6 +312,32 @@ Bangladesh
 45/2 (10 ov)
 Zimbabwe
 141/10
+"""
+
+SAMPLE_ENGLAND_ODI_SCORECARD_MODERN = """\
+England Innings
+India Innings
+Match Flow
+Info
+BATTING
+R B M 4s 6s SR
+Ben Duckett
+c & b Prince Yadav
+141 135 172 16 4 103.70
+Jacob Bethell
+c Sharma b Prasidh Krishna
+91 93 132 8 2 97.84
+Joe Root
+not out
+74 48 72 8 1 154.16
+Harry Brook (c)
+c Kohli b Prasidh Krishna
+14 12 18 1 0 116.66
+Jos Buttler
+not out
+41 13 16 4 3 315.38
+Extras (lb 9, nb 1, w 16) 26
+Total 387 (50 Ov, RR: 7.74)
 """
 
 SAMPLE_FIRST_INNINGS_ODI = """
@@ -525,6 +563,27 @@ def test_post_rules() -> bool:
             ok_live_changed,
         ]
     )
+
+
+def test_excluded_practice_fixtures() -> bool:
+    print("\n=== 3c2. Practice / tour match exclusion ===")
+    tour_block = SAMPLE_PAK_WI_TOUR_MATCH.strip()
+    official_test = SAMPLE_LIVE_TEST_WITH_TOSS.strip()
+    official_odi = SAMPLE_PREVIEW_GOOGLE_ZIM_BAN.strip()
+
+    excluded = is_excluded_fixture(tour_block)
+    not_postable = not is_postable_block(tour_block)
+    official_ok = not is_excluded_fixture(official_test)
+    odi_ok = not is_excluded_fixture(official_odi)
+    odi_postable = is_postable_block(official_odi)
+
+    _status("PAK vs WI Tour Match excluded", excluded)
+    _status("Tour match not postable", not_postable)
+    _status("Official 2nd Test not excluded", official_ok)
+    _status("Official 1st ODI not excluded", odi_ok)
+    _status("Official ODI preview still postable", odi_postable)
+
+    return all([excluded, not_postable, official_ok, odi_ok, odi_postable])
 
 
 def test_preview_caption() -> bool:
@@ -1663,6 +1722,79 @@ def test_scorecard_catchup_on_live_cooldown() -> bool:
     return all_ok
 
 
+def test_england_modern_scorecard() -> bool:
+    print("\n=== 4h. England ODI Modern Scorecard Parse ===")
+    all_ok = True
+
+    def _eng(label: str, cond: bool, detail: str = "") -> None:
+        nonlocal all_ok
+        _status(label, cond, detail)
+        if not cond:
+            all_ok = False
+
+    info = parse_innings_scorecard_text(
+        body_text=SAMPLE_ENGLAND_ODI_SCORECARD_MODERN,
+        batting_team="England",
+        team1="England",
+        team2="India",
+        score="387/3",
+        overs="50",
+        match_label="3rd ODI",
+        series="India tour of England 2026",
+        format_tag="ODI",
+    )
+    _eng("Parse modern ESPN layout", info is not None)
+    if info:
+        names = [b.name for b in info.batters]
+        _eng("Five batters parsed", len(info.batters) == 5, str(len(info.batters)))
+        _eng("Duckett parsed", "Duckett" in names[0], names[0])
+        _eng("Bethell parsed", any("Bethell" in n for n in names), str(names))
+        _eng("Root not out", info.batters[2].not_out and info.batters[2].runs == 74)
+        _eng("No UI tab labels", not any(n in {"Innings", "Flow", "Info"} for n in names), str(names))
+        _eng("Validation passes", scorecard_parse_valid(info))
+        _eng("Extras runs", info.extras_runs == 26, str(info.extras_runs))
+        _eng("Total runs", info.total_runs == 387, str(info.total_runs))
+        try:
+            img_path = generate_scorecard_image(info)
+            from PIL import Image
+
+            with Image.open(img_path) as img:
+                _eng("Image height fits 5 rows", img.height >= 500, f"{img.width}x{img.height}")
+            img_path.unlink(missing_ok=True)
+        except Exception as exc:
+            _eng("Image generation", False, str(exc))
+
+    junk = parse_innings_scorecard_text(
+        body_text="""England Innings
+India Innings
+Match Flow
+Info
+BATTING
+R B M 4s 6s SR
+not out
+74 48 72 8 1 154.16
+not out
+41 13 16 4 3 315.38
+Extras (lb 9) 26
+Total 387 (50 Ov)
+""",
+        batting_team="England",
+        team1="England",
+        team2="India",
+        score="387/3",
+        overs="50",
+        match_label="3rd ODI",
+        series="India tour of England 2026",
+        format_tag="ODI",
+    )
+    if junk and len(junk.batters) < 3:
+        _eng("Junk partial parse rejected by validation", not scorecard_parse_valid(junk))
+    else:
+        _eng("Junk tab-zip layout blocked", junk is None or not scorecard_parse_valid(junk))
+
+    return all_ok
+
+
 async def test_gemini(raw_data: str) -> str | None:
     print("\n=== 4b. Gemini post generation (optional) ===")
     post = await generate_post(raw_data)
@@ -1739,6 +1871,7 @@ async def run(args: argparse.Namespace) -> int:
     test_filter(raw_data)
     multi_ok = test_multi_match_extraction()
     rules_ok = test_post_rules()
+    practice_exclude_ok = test_excluded_practice_fixtures()
     caption_ok = test_preview_caption()
     tomorrow_ok = test_preview_tomorrow()
     timezone_ok = test_preview_timezone()
@@ -1758,6 +1891,7 @@ async def run(args: argparse.Namespace) -> int:
     scorecard_trigger_ok = test_scorecard_trigger_window()
     ban_zim_sc_ok = test_ban_zim_chase_scorecard()
     scorecard_cooldown_ok = test_scorecard_catchup_on_live_cooldown()
+    england_sc_ok = test_england_modern_scorecard()
     posts_ok = test_rule_based_posts()
     gemini_input = extract_tracked_match_data(raw_data) or raw_data
     post_text = await test_gemini(gemini_input.split("\n\n---\n\n")[0])
@@ -1790,8 +1924,9 @@ async def run(args: argparse.Namespace) -> int:
         and scorecard_trigger_ok
         and ban_zim_sc_ok
         and scorecard_cooldown_ok
+        and england_sc_ok
     )
-    if fb_ok and multi_ok and rules_ok and preview_ok and posts_ok:
+    if fb_ok and multi_ok and rules_ok and practice_exclude_ok and preview_ok and posts_ok:
         if post_text and post_text != "rule-based":
             print("Summary: core pipeline OK (rule-based posts + optional Gemini).")
         else:
