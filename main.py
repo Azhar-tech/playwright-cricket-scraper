@@ -92,6 +92,7 @@ from match_image import (
     build_preview_caption,
     build_scorecard_caption,
     build_update_caption,
+    generate_captain_toss_image,
     generate_match_image,
     generate_preview_image,
     generate_scorecard_image,
@@ -104,6 +105,7 @@ from match_image import (
     parse_preview_block,
     scorecard_parse_valid,
 )
+from captain_toss import captain_toss_ready, try_build_captain_toss_info
 from playing_xi import (
     PlayingXiPlayer,
     build_playing_xi_caption,
@@ -1254,17 +1256,37 @@ def _toss_announced(block: str) -> bool:
     return bool(TOSS_PATTERN.search(block))
 
 
+async def _resolve_toss_image(
+    page: Page,
+    block: str,
+    match_key: str,
+    match_links: dict[str, str],
+    update_info: MatchUpdateInfo,
+) -> Path:
+    match_url = _resolve_match_url(match_key, match_links)
+    captains = await try_build_captain_toss_info(page, match_url, update_info)
+    if captain_toss_ready(captains):
+        logger.info("Using captain toss graphic for %s", match_key)
+        return generate_captain_toss_image(update_info, captains)  # type: ignore[arg-type]
+    if captains is not None:
+        logger.info("Captain toss fallback to flag graphic for %s", match_key)
+    return generate_match_image(update_info)
+
+
 async def _publish_toss_update(
     block: str,
     match_key: str,
     config: dict[str, str],
     state: PostState,
+    *,
+    page: Page,
+    match_links: dict[str, str],
 ) -> bool:
     try:
         update_info = parse_match_block(block, "toss")
         if not update_info.match_key:
             update_info.match_key = match_key
-        image_path = generate_match_image(update_info)
+        image_path = await _resolve_toss_image(page, block, match_key, match_links, update_info)
         post_text = build_update_caption(update_info)
     except Exception as exc:
         logger.error("Toss image generation failed for %s: %s", match_key, exc)
@@ -1438,7 +1460,14 @@ async def post_missed_toss_and_playing_xi(
             if posted_count > 0:
                 logger.info("Waiting %ds before missed toss post", INTER_MATCH_POST_DELAY)
                 await asyncio.sleep(INTER_MATCH_POST_DELAY)
-            if await _publish_toss_update(toss_block, match_key, config, state):
+            if await _publish_toss_update(
+                toss_block,
+                match_key,
+                config,
+                state,
+                page=page,
+                match_links=match_links,
+            ):
                 posted_count += 1
                 toss_done = True
                 just_posted_toss = True
@@ -2165,7 +2194,12 @@ async def run_cycle(
                         innings_break = update_info.innings_status == "innings_break"
                         session_break = update_info.session_break
                         test_day = update_info.test_day
-                    image_path = generate_match_image(update_info)
+                    if phase == "toss":
+                        image_path = await _resolve_toss_image(
+                            page, block, match_key, match_links, update_info
+                        )
+                    else:
+                        image_path = generate_match_image(update_info)
                     post_text = build_update_caption(update_info)
                     use_photo = True
                 except Exception as exc:

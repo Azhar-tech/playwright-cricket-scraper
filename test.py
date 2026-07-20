@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 from datetime import date
+from pathlib import Path
 
 import requests
 from playwright.async_api import async_playwright
@@ -43,6 +45,9 @@ from match_image import (
 from playing_xi import (
     build_playing_xi_caption,
     build_playing_xi_info,
+    captain_display_name,
+    captains_from_squads,
+    find_team_captain,
     generate_playing_xi_image,
     make_playing_xi_key,
     match_playing_xi_urls,
@@ -1123,6 +1128,95 @@ def test_toss_card_colors() -> bool:
     return all_ok and diff_ok
 
 
+def _ensure_fixture_headshot(name: str, color: tuple[int, int, int]) -> Path:
+    from PIL import Image
+
+    from captain_toss import CAPTAIN_CACHE_DIR
+
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    CAPTAIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CAPTAIN_CACHE_DIR / f"{slug}.jpg"
+    if not path.exists() or path.stat().st_size < 1024:
+        Image.new("RGB", (220, 220), color).save(path, "JPEG", quality=90)
+    return path
+
+
+def test_captain_from_squads() -> bool:
+    print("\n=== 3g3. Captain extraction from Playing XI ===")
+    squads = parse_playing_xi_from_match_text(
+        SAMPLE_PLAYING_XI_TEXT.strip(), "England", "India"
+    )
+    eng_captain = find_team_captain(squads["England"])
+    ind_captain = find_team_captain(squads["India"])
+    captains = captains_from_squads(squads, "England", "India")
+
+    eng_ok = eng_captain is not None and eng_captain.roles == "C+WK"
+    ind_ok = ind_captain is not None and ind_captain.roles == "C"
+    names_ok = (
+        captain_display_name(eng_captain) == "Jos Buttler"
+        and captain_display_name(ind_captain) == "Rohit Sharma"
+    )
+    both_ok = set(captains.keys()) == {"England", "India"}
+
+    _status("England captain role parsed", eng_ok, eng_captain.roles if eng_captain else "")
+    _status("India captain role parsed", ind_ok, ind_captain.roles if ind_captain else "")
+    _status("Captain display names cleaned", names_ok)
+    _status("Both captains found in squads", both_ok)
+
+    return eng_ok and ind_ok and names_ok and both_ok
+
+
+def test_captain_toss_image(keep_image: bool = False) -> bool:
+    print("\n=== 3g4. Captain toss graphic ===")
+    from PIL import Image
+
+    from match_image import CaptainInfo, CaptainTossInfo, generate_captain_toss_image, parse_match_block
+
+    buttler_path = _ensure_fixture_headshot("Jos Buttler", (30, 80, 160))
+    rohit_path = _ensure_fixture_headshot("Rohit Sharma", (180, 40, 40))
+    info = parse_match_block(SAMPLE_TOSS_BLOCK.strip(), "toss")
+    captains = CaptainTossInfo(
+        team1_captain=CaptainInfo(team="England", name="Jos Buttler", image_path=buttler_path),
+        team2_captain=CaptainInfo(team="India", name="Rohit Sharma", image_path=rohit_path),
+    )
+
+    try:
+        path = generate_captain_toss_image(info, captains)
+        ok = path.exists() and path.stat().st_size >= 10_000
+        if ok:
+            with Image.open(path) as img:
+                ok = img.size == (1080, 540)
+        _status("Generate captain toss PNG", ok, str(path))
+        if ok and not keep_image:
+            path.unlink(missing_ok=True)
+        return ok
+    except Exception as exc:
+        _status("Generate captain toss PNG", False, str(exc))
+        return False
+
+
+def test_toss_fallback() -> bool:
+    print("\n=== 3g5. Toss flag fallback without captain images ===")
+    from PIL import Image
+
+    from match_image import CaptainInfo, CaptainTossInfo, generate_match_image, parse_match_block
+
+    info = parse_match_block(SAMPLE_TOSS_BLOCK.strip(), "toss")
+    partial = CaptainTossInfo(
+        team1_captain=CaptainInfo(team="England", name="Jos Buttler", image_path=None),
+        team2_captain=CaptainInfo(team="India", name="Rohit Sharma", image_path=None),
+    )
+    path = generate_match_image(info, partial)
+    ok = path.exists() and path.stat().st_size >= 10_000
+    if ok:
+        with Image.open(path) as img:
+            ok = img.size == (1080, 540)
+    _status("Missing captain images fall back to flag toss card", ok, str(path))
+    if ok:
+        path.unlink(missing_ok=True)
+    return ok
+
+
 def test_live_posting_flow() -> bool:
     print("\n=== 3h. Live posting flow ===")
     toss_only = SAMPLE_TOSS_BLOCK.strip()
@@ -1879,6 +1973,9 @@ async def run(args: argparse.Namespace) -> int:
     image_ok = test_preview_image_generation(keep_image=args.preview_image)
     match_image_ok = test_match_image_generation(keep_image=args.match_image)
     toss_colors_ok = test_toss_card_colors()
+    captain_squads_ok = test_captain_from_squads()
+    captain_toss_ok = test_captain_toss_image(keep_image=args.match_image)
+    toss_fallback_ok = test_toss_fallback()
     live_flow_ok = test_live_posting_flow()
     score_parse_ok = test_odi_overs_score_parsing()
     innings_layout_ok = test_innings_layouts(keep_image=args.match_image)
@@ -1912,6 +2009,9 @@ async def run(args: argparse.Namespace) -> int:
         and image_ok
         and match_image_ok
         and toss_colors_ok
+        and captain_squads_ok
+        and captain_toss_ok
+        and toss_fallback_ok
         and live_flow_ok
         and score_parse_ok
         and innings_layout_ok

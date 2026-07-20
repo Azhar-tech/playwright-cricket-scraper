@@ -316,6 +316,13 @@ TOSS_HEADLINE_Y = 248
 TOSS_HEADLINE_PANEL_W = 860
 TOSS_HEADLINE_PANEL_H = 96
 TOSS_FOOTER_Y = 490
+TOSS_CAPTAIN_PHOTO_SIZE = 110
+TOSS_SMALL_FLAG_W = 56
+TOSS_SMALL_FLAG_H = 40
+TOSS_SMALL_FLAG_Y = 58
+TOSS_CAPTAIN_PHOTO_Y = 108
+TOSS_CAPTAIN_NAME_Y = 228
+TOSS_TEAM_LABEL_Y = 168
 
 # ---------------------------------------------------------------------------
 # Scorecard image layout constants (premium dark)
@@ -404,6 +411,19 @@ class MatchUpdateInfo:
     bowlers: list[str] = field(default_factory=list)
     test_day: int = 0
     session_break: str = ""
+
+
+@dataclass
+class CaptainInfo:
+    team: str
+    name: str
+    image_path: Path | None = None
+
+
+@dataclass
+class CaptainTossInfo:
+    team1_captain: CaptainInfo
+    team2_captain: CaptainInfo
 
 
 @dataclass
@@ -1709,6 +1729,81 @@ def _paste_flag_in_colored_frame(
     base.paste(flag, (flag_x, flag_y), flag)
 
 
+def _toss_winner_team(info: MatchUpdateInfo) -> str:
+    headline = (info.headline or "").lower()
+    if "won the toss" in headline:
+        for team in (info.team1, info.team2):
+            if team.lower() in headline:
+                return team
+    for team in (info.team1, info.team2):
+        if headline.startswith(team.lower()) or f"{team.lower()} chose" in headline:
+            return team
+    return ""
+
+
+def _load_circular_headshot(
+    image_path: Path,
+    size: int,
+    *,
+    ring_color: str = "#FFFFFF",
+    ring_width: int = 4,
+    highlight: bool = False,
+) -> Image.Image:
+    with Image.open(image_path) as raw:
+        img = raw.convert("RGBA")
+    min_side = min(img.size)
+    left = (img.width - min_side) // 2
+    top = (img.height - min_side) // 2
+    img = img.crop((left, top, left + min_side, top + min_side))
+    img = img.resize((size, size), Image.Resampling.LANCZOS)
+
+    mask = Image.new("L", (size, size), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.ellipse((0, 0, size, size), fill=255)
+    img.putalpha(mask)
+
+    outer = size + ring_width * 2
+    if highlight:
+        ring_width += 2
+        outer = size + ring_width * 2
+    canvas = Image.new("RGBA", (outer, outer), (0, 0, 0, 0))
+    ring_draw = ImageDraw.Draw(canvas)
+    ring_draw.ellipse((0, 0, outer - 1, outer - 1), fill=ring_color)
+    canvas.paste(img, (ring_width, ring_width), img)
+    return canvas
+
+
+def _paste_headshot_centered(
+    base: Image.Image,
+    image_path: Path,
+    center_x: int,
+    top_y: int,
+    *,
+    highlight: bool = False,
+    team: str = "",
+) -> None:
+    ring_color = _team_kit_colors(team)[0] if team else "#FFFFFF"
+    headshot = _load_circular_headshot(
+        image_path,
+        TOSS_CAPTAIN_PHOTO_SIZE,
+        ring_color=ring_color,
+        ring_width=5 if highlight else 3,
+        highlight=highlight,
+    )
+    x = center_x - headshot.width // 2
+    base.paste(headshot, (x, top_y), headshot)
+
+
+def _paste_small_flag_centered(
+    base: Image.Image,
+    team: str,
+    center_x: int,
+    top_y: int,
+) -> None:
+    flag = _load_team_flag(team, TOSS_SMALL_FLAG_W, TOSS_SMALL_FLAG_H, 6)
+    _paste_flag_centered(base, flag, center_x, top_y)
+
+
 def _draw_centered_text(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -2095,6 +2190,93 @@ def _draw_toss_card(info: MatchUpdateInfo) -> Image.Image:
             headline,
             UPDATE_IMAGE_WIDTH // 2,
             TOSS_HEADLINE_Y,
+            headline_font,
+            TEXT_PRIMARY,
+        )
+
+    _draw_centered_text(
+        draw,
+        _update_footer_line(info),
+        UPDATE_IMAGE_WIDTH // 2,
+        TOSS_FOOTER_Y,
+        footer_font,
+        TEXT_MUTED,
+    )
+    return img
+
+
+def _draw_captain_toss_card(info: MatchUpdateInfo, captains: CaptainTossInfo) -> Image.Image:
+    img = _draw_toss_background(
+        UPDATE_IMAGE_WIDTH, TOSS_IMAGE_HEIGHT, info.team1, info.team2
+    )
+    winner = _toss_winner_team(info)
+
+    _paste_small_flag_centered(img, info.team1, TOSS_LEFT_X, TOSS_SMALL_FLAG_Y)
+    _paste_small_flag_centered(img, info.team2, TOSS_RIGHT_X, TOSS_SMALL_FLAG_Y)
+
+    if captains.team1_captain.image_path:
+        _paste_headshot_centered(
+            img,
+            captains.team1_captain.image_path,
+            TOSS_LEFT_X,
+            TOSS_CAPTAIN_PHOTO_Y,
+            highlight=info.team1 == winner,
+            team=info.team1,
+        )
+    if captains.team2_captain.image_path:
+        _paste_headshot_centered(
+            img,
+            captains.team2_captain.image_path,
+            TOSS_RIGHT_X,
+            TOSS_CAPTAIN_PHOTO_Y,
+            highlight=info.team2 == winner,
+            team=info.team2,
+        )
+
+    draw = ImageDraw.Draw(img)
+    badge_font = _load_font(22, bold=True)
+    team_font = _load_font(24, bold=True)
+    captain_font = _load_font(22, bold=True)
+    headline_font = _load_font(30, bold=True)
+    footer_font = _load_font(24, bold=False)
+
+    _draw_centered_text(draw, "TOSS", UPDATE_IMAGE_WIDTH // 2, TOSS_BADGE_Y, badge_font, TEXT_MUTED)
+    _draw_centered_text(draw, info.team1, TOSS_LEFT_X, TOSS_TEAM_LABEL_Y, team_font, TEXT_PRIMARY)
+    _draw_centered_text(draw, info.team2, TOSS_RIGHT_X, TOSS_TEAM_LABEL_Y, team_font, TEXT_PRIMARY)
+
+    cap1 = captains.team1_captain.name
+    cap2 = captains.team2_captain.name
+    if len(cap1) > 18:
+        cap1 = cap1[:16] + "..."
+    if len(cap2) > 18:
+        cap2 = cap2[:16] + "..."
+    _draw_centered_text(draw, cap1, TOSS_LEFT_X, TOSS_CAPTAIN_NAME_Y, captain_font, TEXT_PRIMARY)
+    _draw_centered_text(draw, cap2, TOSS_RIGHT_X, TOSS_CAPTAIN_NAME_Y, captain_font, TEXT_PRIMARY)
+
+    if info.headline:
+        headline = info.headline
+        if len(headline) > 70:
+            headline = headline[:67] + "..."
+
+        panel_x = (UPDATE_IMAGE_WIDTH - TOSS_HEADLINE_PANEL_W) // 2
+        panel_y = TOSS_HEADLINE_Y - 8
+        overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, TOSS_IMAGE_HEIGHT), (0, 0, 0, 0))
+        panel_draw = ImageDraw.Draw(overlay)
+        panel_draw.rounded_rectangle(
+            [
+                (panel_x, panel_y),
+                (panel_x + TOSS_HEADLINE_PANEL_W, panel_y + TOSS_HEADLINE_PANEL_H),
+            ],
+            radius=12,
+            fill=(255, 255, 255, 210),
+        )
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        _draw_centered_text(
+            draw,
+            headline,
+            UPDATE_IMAGE_WIDTH // 2,
+            TOSS_HEADLINE_Y + 8,
             headline_font,
             TEXT_PRIMARY,
         )
@@ -3046,11 +3228,27 @@ def _draw_match_update_card(info: MatchUpdateInfo) -> Image.Image:
     return _draw_compact_update_card(info)
 
 
-def generate_match_image(info: MatchUpdateInfo) -> Path:
+def generate_match_image(info: MatchUpdateInfo, captains: CaptainTossInfo | None = None) -> Path:
     GENERATED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     safe_key = re.sub(r"[^\w\-]", "_", info.match_key)[:80]
     output_path = GENERATED_IMAGES_DIR / f"{info.phase}_{safe_key}.png"
-    _draw_match_update_card(info).save(output_path, "PNG")
+    if (
+        info.phase == "toss"
+        and captains
+        and captains.team1_captain.image_path
+        and captains.team2_captain.image_path
+    ):
+        _draw_captain_toss_card(info, captains).save(output_path, "PNG")
+    else:
+        _draw_match_update_card(info).save(output_path, "PNG")
+    return output_path
+
+
+def generate_captain_toss_image(info: MatchUpdateInfo, captains: CaptainTossInfo) -> Path:
+    GENERATED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r"[^\w\-]", "_", info.match_key)[:80]
+    output_path = GENERATED_IMAGES_DIR / f"toss_captain_{safe_key}.png"
+    _draw_captain_toss_card(info, captains).save(output_path, "PNG")
     return output_path
 
 

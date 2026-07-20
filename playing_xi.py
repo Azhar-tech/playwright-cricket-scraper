@@ -74,6 +74,34 @@ def make_playing_xi_key(match_key: str, team: str) -> str:
     return f"{match_key}|{_team_slug(team)}"
 
 
+def find_team_captain(players: list[PlayingXiPlayer]) -> PlayingXiPlayer | None:
+    for player in players:
+        if player.roles in ("C", "C+WK"):
+            return player
+    return None
+
+
+def captain_display_name(player: PlayingXiPlayer) -> str:
+    name = re.sub(r"\s*\([^)]*\)\s*$", "", player.name).strip()
+    return name.title()
+
+
+def captains_from_squads(
+    squads: dict[str, list[PlayingXiPlayer]],
+    team1: str,
+    team2: str,
+) -> dict[str, PlayingXiPlayer]:
+    result: dict[str, PlayingXiPlayer] = {}
+    for team in (team1, team2):
+        players = squads.get(team)
+        if not players:
+            continue
+        captain = find_team_captain(players)
+        if captain:
+            result[team] = captain
+    return result
+
+
 def match_playing_xi_urls(match_url: str) -> list[str]:
     base = match_url.rstrip("/")
     # Strip known ESPN page-specific suffixes so we always start from the base match URL
