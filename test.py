@@ -52,6 +52,8 @@ from playing_xi import (
     make_playing_xi_key,
     match_playing_xi_urls,
     parse_playing_xi_from_match_text,
+    parse_playing_xi_table_rows,
+    enrich_captain_roles_from_text,
     _match_label_from_block,
 )
 from post_builder import build_match_post, build_result_post
@@ -63,6 +65,7 @@ from main import (
     _best_block_for_playing_xi,
     _first_innings_batting_team,
     _playing_xi_allowed,
+    _playing_xi_blocked_by_live,
     _playing_xi_pending,
     _scorecard_skip_reason,
     _should_post_innings_scorecard,
@@ -399,6 +402,32 @@ India
 9. Kuldeep Yadav
 10. Jasprit Bumrah
 11. Mohammed Siraj
+"""
+
+SAMPLE_NZ_WI_XI_TABLE = """
+| | West Indies | New Zealand |
+| 1 | Ackeem Auguste top-order batter | Henry Nicholls top-order batter |
+| 2 | Justin Greaves allrounder | Will Young top-order batter |
+| 3 | Keacy Carty batter | Nick Kelly top-order batter |
+| 4 | Shai Hope † (c) wicketkeeper batter | Mark Chapman allrounder |
+| 5 | Sherfane Rutherford middle-order batter | Tom Latham † wicketkeeper batter |
+| 6 | Shimron Hetmyer middle-order batter | Michael Bracewell batting allrounder |
+| 7 | Gudakesh Motie bowler | Mitchell Santner (c) bowling allrounder |
+| 8 | Matthew Forde bowler | Nathan Smith bowling allrounder |
+| 9 | Alzarri Joseph bowler | Kristian Clarke bowler |
+| 10 | Jayden Seales bowler | Jacob Duffy bowler |
+| 11 | Vitel Lawes bowler | Jayden Lennox bowler |
+"""
+
+SAMPLE_NZ_WI_LIVE_WITH_TOSS = """
+LIVE
+New Zealand tour of West Indies 2026
+5th ODI (D/N), Bridgetown, July 21, 2026
+West Indies
+New Zealand
+4/0
+(0.3 ov)
+West Indies won the toss and elected to field
 """
 
 PASS = "PASS"
@@ -783,7 +812,7 @@ def test_playing_xi_live_guard() -> bool:
     state.toss_posted.add(match_key)
     allowed_live = _playing_xi_allowed(match_key, live_block, state)
     abandoned = match_key in state.playing_xi_abandoned
-    _status("Live block with toss text blocked", not allowed_live and abandoned)
+    _status("Live block with toss posted is blocked but not abandoned", not allowed_live and not abandoned)
 
     state2 = PostState()
     state2.toss_posted.add(match_key)
@@ -814,7 +843,7 @@ def test_playing_xi_live_guard() -> bool:
 
     return (
         not allowed_live
-        and abandoned
+        and not abandoned
         and allowed_before_delay
         and delay_remaining > 100
         and allowed_after_delay
@@ -1164,6 +1193,80 @@ def test_captain_from_squads() -> bool:
     _status("Both captains found in squads", both_ok)
 
     return eng_ok and ind_ok and names_ok and both_ok
+
+
+def test_nz_wi_captain_parse() -> bool:
+    print("\n=== 3g3b. NZ vs WI ESPN table captain parsing ===")
+    from playing_xi import PlayingXiPlayer
+
+    table_squads = parse_playing_xi_table_rows(
+        SAMPLE_NZ_WI_XI_TABLE.strip(), "West Indies", "New Zealand"
+    )
+    wi_ok = len(table_squads.get("West Indies", [])) == 11
+    nz_ok = len(table_squads.get("New Zealand", [])) == 11
+    wi_cap = find_team_captain(table_squads["West Indies"])
+    nz_cap = find_team_captain(table_squads["New Zealand"])
+    hope_ok = wi_cap is not None and "HOPE" in wi_cap.name and wi_cap.roles in ("C", "C+WK")
+    santner_ok = nz_cap is not None and "SANTNER" in nz_cap.name and nz_cap.roles == "C"
+
+    json_like = {
+        "West Indies": [
+            PlayingXiPlayer(number=i, name=f"PLAYER {i}", roles="")
+            for i in range(1, 12)
+        ],
+        "New Zealand": [
+            PlayingXiPlayer(number=i, name=f"PLAYER {i}", roles="")
+            for i in range(1, 12)
+        ],
+    }
+    json_like["West Indies"][3] = PlayingXiPlayer(number=4, name="SHAI HOPE", roles="")
+    json_like["New Zealand"][6] = PlayingXiPlayer(number=7, name="MITCHELL SANTNER", roles="")
+    enrich_captain_roles_from_text(json_like, SAMPLE_NZ_WI_XI_TABLE)
+    enriched_wi = find_team_captain(json_like["West Indies"])
+    enriched_nz = find_team_captain(json_like["New Zealand"])
+    enrich_ok = (
+        enriched_wi is not None
+        and enriched_wi.roles in ("C", "C+WK")
+        and enriched_nz is not None
+        and enriched_nz.roles == "C"
+    )
+
+    _status("WI table XI parsed (11 players)", wi_ok)
+    _status("NZ table XI parsed (11 players)", nz_ok)
+    _status("Shai Hope captain from table", hope_ok, wi_cap.name if wi_cap else "")
+    _status("Mitchell Santner captain from table", santner_ok, nz_cap.name if nz_cap else "")
+    _status("JSON squads enriched with captain roles", enrich_ok)
+
+    return wi_ok and nz_ok and hope_ok and santner_ok and enrich_ok
+
+
+def test_toss_before_live_order() -> bool:
+    print("\n=== 3g3c. Toss-before-live XI catch-up ===")
+    from datetime import datetime
+
+    toss_block = SAMPLE_TOSS_BLOCK.strip()
+    live_block = SAMPLE_NZ_WI_LIVE_WITH_TOSS.strip()
+    match_key = make_match_key(toss_block)
+
+    state = PostState()
+    state.toss_posted.add(match_key)
+    state.live_last[match_key] = {
+        "at": datetime.now().isoformat(),
+        "text": "live",
+        "signature": "live",
+    }
+
+    blocked_live = _playing_xi_blocked_by_live(live_block, state, match_key)
+    allowed_toss = _playing_xi_allowed(match_key, toss_block, state)
+    _status("Live block still blocked after toss posted", blocked_live)
+    _status("Toss block allowed for XI catch-up after live started", allowed_toss)
+
+    state_no_toss = PostState()
+    state_no_toss.live_last[match_key] = state.live_last[match_key]
+    blocked_without_toss = _playing_xi_blocked_by_live(toss_block, state_no_toss, match_key)
+    _status("Toss block blocked when live started before toss posted", blocked_without_toss)
+
+    return blocked_live and allowed_toss and blocked_without_toss
 
 
 def test_captain_toss_image(keep_image: bool = False) -> bool:
@@ -1974,6 +2077,8 @@ async def run(args: argparse.Namespace) -> int:
     match_image_ok = test_match_image_generation(keep_image=args.match_image)
     toss_colors_ok = test_toss_card_colors()
     captain_squads_ok = test_captain_from_squads()
+    nz_wi_captain_ok = test_nz_wi_captain_parse()
+    toss_before_live_ok = test_toss_before_live_order()
     captain_toss_ok = test_captain_toss_image(keep_image=args.match_image)
     toss_fallback_ok = test_toss_fallback()
     live_flow_ok = test_live_posting_flow()
@@ -2010,6 +2115,8 @@ async def run(args: argparse.Namespace) -> int:
         and match_image_ok
         and toss_colors_ok
         and captain_squads_ok
+        and nz_wi_captain_ok
+        and toss_before_live_ok
         and captain_toss_ok
         and toss_fallback_ok
         and live_flow_ok

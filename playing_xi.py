@@ -50,6 +50,11 @@ ROLE_SUFFIX = re.compile(
     r"\s*\(\s*(c\s*(?:&|and)\s*wk|c\s*&\s*wk|captain\s*(?:&|and)\s*w+k+|c\+wk|c\s*&\s*wk|c|wk|w+k)\s*\)\s*$",
     re.IGNORECASE,
 )
+ROLE_INLINE = re.compile(
+    r"\(\s*(c\s*(?:&|and)\s*wk|c\s*&\s*wk|captain\s*(?:&|and)\s*w+k+|c\+wk|c\s*&\s*wk|c)\s*\)",
+    re.IGNORECASE,
+)
+XI_TABLE_ROW = re.compile(r"^\|?\s*(\d+)\s*\|")
 
 
 @dataclass
@@ -82,8 +87,19 @@ def find_team_captain(players: list[PlayingXiPlayer]) -> PlayingXiPlayer | None:
 
 
 def captain_display_name(player: PlayingXiPlayer) -> str:
-    name = re.sub(r"\s*\([^)]*\)\s*$", "", player.name).strip()
+    name = ROLE_INLINE.sub("", player.name)
+    name = ROLE_SUFFIX.sub("", name)
+    name = re.sub(r"\s*†\s*", " ", name)
+    name = re.sub(r"\s*\([^)]*\)\s*", " ", name).strip()
     return name.title()
+
+
+def _normalize_player_key(name: str) -> str:
+    cleaned = ROLE_INLINE.sub("", name)
+    cleaned = ROLE_SUFFIX.sub("", cleaned)
+    cleaned = re.sub(r"\s*†\s*", " ", cleaned)
+    cleaned = re.sub(r"\([^)]*\)", " ", cleaned)
+    return re.sub(r"[^a-z]", "", cleaned.lower())
 
 
 def captains_from_squads(
@@ -117,19 +133,45 @@ def match_playing_xi_urls(match_url: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def _roles_from_token(role_token: str) -> str:
+    token = role_token.lower().replace(" ", "").replace("and", "")
+    if "c" in token and "wk" in token:
+        return "C+WK"
+    if token.startswith("c") or "captain" in token:
+        return "C"
+    if "wk" in token:
+        return "WK"
+    return ""
+
+
+def _clean_player_display_name(raw_name: str) -> str:
+    name = ROLE_INLINE.sub("", raw_name)
+    name = ROLE_SUFFIX.sub("", name)
+    name = re.sub(r"\s*†\s*", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
 def _parse_player_roles(raw_name: str) -> tuple[str, str]:
+    inline = ROLE_INLINE.search(raw_name)
+    if inline:
+        roles = _roles_from_token(inline.group(1))
+        name = _clean_player_display_name(raw_name)
+        if roles == "C" and ("†" in raw_name or re.search(r"\bwk\b", raw_name, re.IGNORECASE)):
+            roles = "C+WK"
+        elif roles == "" and re.search(r"\bwk\b", raw_name, re.IGNORECASE):
+            roles = "WK"
+        return name, roles
+
     match = ROLE_SUFFIX.search(raw_name)
     if not match:
-        return raw_name.strip(), ""
-    role_token = match.group(1).lower().replace(" ", "").replace("and", "")
-    name = ROLE_SUFFIX.sub("", raw_name).strip()
-    if "c" in role_token and "wk" in role_token:
-        return name, "C+WK"
-    if role_token.startswith("c") or "captain" in role_token:
-        return name, "C"
-    if "wk" in role_token:
-        return name, "WK"
-    return name, ""
+        name = _clean_player_display_name(raw_name)
+        if re.search(r"\bwk\b", raw_name, re.IGNORECASE) or "†" in raw_name:
+            return name, "WK"
+        return name, ""
+    roles = _roles_from_token(match.group(1))
+    name = _clean_player_display_name(raw_name)
+    return name, roles
 
 
 def _player_from_line(number: int, raw_line: str) -> PlayingXiPlayer:
@@ -166,6 +208,110 @@ def _extract_team_players(lines: list[str], start: int, team: str) -> list[Playi
     return players[:11]
 
 
+def parse_playing_xi_table_rows(
+    text: str,
+    team1: str,
+    team2: str,
+) -> dict[str, list[PlayingXiPlayer]]:
+    """Parse ESPN table-style XI rows: | 4 | Shai Hope (c) ... | Mitchell Santner (c) ... |"""
+    squads: dict[str, list[PlayingXiPlayer]] = {team1: [], team2: []}
+    col_teams: list[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if "|" not in stripped:
+            continue
+        parts = [part.strip() for part in stripped.split("|") if part.strip()]
+        if not parts:
+            continue
+
+        if not col_teams and len(parts) >= 2:
+            detected = []
+            for part in parts:
+                if _team_matches(part, team1):
+                    detected.append(_normalize_team_name(team1))
+                elif _team_matches(part, team2):
+                    detected.append(_normalize_team_name(team2))
+            if len(detected) == 2:
+                col_teams = detected
+                continue
+
+        row_match = XI_TABLE_ROW.match(stripped)
+        if not row_match or len(parts) < 3:
+            continue
+
+        try:
+            number = int(parts[0])
+        except ValueError:
+            continue
+
+        cells = parts[1:]
+        teams = col_teams or [team1, team2]
+        for idx, cell in enumerate(cells[: len(teams)]):
+            if number > 11:
+                break
+            team = teams[idx]
+            if team not in squads:
+                continue
+            squads[team].append(_player_from_line(number, cell))
+
+    return {
+        team: players[:11]
+        for team, players in squads.items()
+        if len(players) >= 11
+    }
+
+
+def _merge_role_metadata(
+    target: dict[str, list[PlayingXiPlayer]],
+    source: dict[str, list[PlayingXiPlayer]],
+) -> None:
+    for team, src_players in source.items():
+        if team not in target:
+            continue
+        for src in src_players:
+            if src.roles not in ("C", "C+WK", "WK"):
+                continue
+            src_key = _normalize_player_key(src.name)
+            for player in target[team]:
+                tgt_key = _normalize_player_key(player.name)
+                if not src_key or not tgt_key:
+                    continue
+                if src_key == tgt_key or src_key in tgt_key or tgt_key in src_key:
+                    player.roles = src.roles
+                    display = _clean_player_display_name(player.name).upper()
+                    if src.roles:
+                        display = f"{display} ({src.roles})"
+                    player.name = display
+                    break
+
+
+def enrich_captain_roles_from_text(
+    squads: dict[str, list[PlayingXiPlayer]],
+    text: str,
+) -> None:
+    teams = list(squads.keys())
+    table_squads: dict[str, list[PlayingXiPlayer]] = {}
+    if len(teams) == 2:
+        table_squads = parse_playing_xi_table_rows(text, teams[0], teams[1])
+    if table_squads:
+        _merge_role_metadata(squads, table_squads)
+
+    for line in text.splitlines():
+        if not ROLE_INLINE.search(line):
+            continue
+        for team, players in squads.items():
+            for player in players:
+                if player.roles in ("C", "C+WK"):
+                    continue
+                player_key = _normalize_player_key(player.name)
+                if player_key and player_key in _normalize_player_key(line):
+                    roles = _parse_player_roles(line)[1] or "C"
+                    player.roles = roles
+                    display = _clean_player_display_name(player.name).upper()
+                    player.name = f"{display} ({roles})"
+
+
 def parse_playing_xi_from_match_text(
     text: str,
     team1: str,
@@ -194,25 +340,50 @@ def parse_playing_xi_from_match_text(
 
 
 def _player_from_json_obj(obj: dict, index: int) -> PlayingXiPlayer | None:
+    nested = obj.get("player") if isinstance(obj.get("player"), dict) else {}
     name = (
         obj.get("name")
         or obj.get("fullName")
         or obj.get("longName")
-        or (obj.get("player") or {}).get("name")
-        or (obj.get("player") or {}).get("longName")
+        or nested.get("name")
+        or nested.get("fullName")
+        or nested.get("longName")
     )
     if not name or not isinstance(name, str):
         return None
 
+    is_captain = bool(
+        obj.get("isCaptain")
+        or obj.get("is_captain")
+        or obj.get("captain")
+        or nested.get("isCaptain")
+        or nested.get("is_captain")
+        or nested.get("captain")
+    )
+    is_keeper = bool(
+        obj.get("isKeeper")
+        or obj.get("is_keeper")
+        or obj.get("keeper")
+        or nested.get("isKeeper")
+        or nested.get("is_keeper")
+        or nested.get("keeper")
+    )
+
     roles = ""
-    if obj.get("isCaptain") and obj.get("isKeeper"):
+    if is_captain and is_keeper:
         roles = "C+WK"
-    elif obj.get("isCaptain"):
+    elif is_captain:
         roles = "C"
-    elif obj.get("isKeeper"):
+    elif is_keeper:
         roles = "WK"
     else:
-        role_field = str(obj.get("role") or obj.get("playerRole") or "").lower()
+        role_field = str(
+            obj.get("role")
+            or obj.get("playerRole")
+            or nested.get("role")
+            or nested.get("playerRole")
+            or ""
+        ).lower()
         if "captain" in role_field and "keeper" in role_field:
             roles = "C+WK"
         elif "captain" in role_field:
@@ -220,7 +391,11 @@ def _player_from_json_obj(obj: dict, index: int) -> PlayingXiPlayer | None:
         elif "keeper" in role_field or "wicket" in role_field:
             roles = "WK"
 
-    display = name.strip().upper()
+    if not roles:
+        _, parsed_roles = _parse_player_roles(name)
+        roles = parsed_roles
+
+    display = _clean_player_display_name(name).upper()
     if roles:
         display = f"{display} ({roles})"
     return PlayingXiPlayer(number=index, name=display, roles=roles)
@@ -353,20 +528,27 @@ def parse_playing_xi_from_html(
     team2: str,
 ) -> dict[str, list[PlayingXiPlayer]]:
     squads = parse_playing_xi_from_next_data(html)
-    if team1 in squads and team2 in squads:
-        return squads
 
     normalized: dict[str, list[PlayingXiPlayer]] = {}
     for key, players in squads.items():
         norm = _normalize_team_name(key)
         normalized[norm] = players
+
+    table_squads = parse_playing_xi_table_rows(text, team1, team2)
+    text_squads = parse_playing_xi_from_match_text(text, team1, team2)
+
+    for team in (team1, team2):
+        if team not in normalized and team in table_squads:
+            normalized[team] = table_squads[team]
+        elif team not in normalized and team in text_squads:
+            normalized[team] = text_squads[team]
+
     if team1 in normalized and team2 in normalized:
+        _merge_role_metadata(normalized, table_squads)
+        _merge_role_metadata(normalized, text_squads)
+        enrich_captain_roles_from_text(normalized, text)
         return normalized
 
-    text_squads = parse_playing_xi_from_match_text(text, team1, team2)
-    for team in (team1, team2):
-        if team not in normalized and team in text_squads:
-            normalized[team] = text_squads[team]
     return normalized
 
 

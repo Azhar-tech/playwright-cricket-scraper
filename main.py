@@ -1200,6 +1200,17 @@ def _match_underway(block: str, state: PostState) -> bool:
     return phase in ("live", "result")
 
 
+def _playing_xi_blocked_by_live(block: str, state: PostState, match_key: str) -> bool:
+    phase = block_match_phase(block, state=state)
+    if phase in ("live", "result"):
+        return True
+    if match_key not in state.live_last:
+        return False
+    if match_key not in state.toss_posted:
+        return True
+    return False
+
+
 def _abandon_playing_xi(match_key: str, state: PostState) -> None:
     if match_key in state.playing_xi_abandoned:
         return
@@ -1212,12 +1223,13 @@ def _playing_xi_allowed(match_key: str, block: str, state: PostState) -> bool:
     if match_key in state.playing_xi_abandoned:
         logger.info("Playing XI skipped for %s — abandoned", match_key)
         return False
-    if _match_underway(block, state):
-        _abandon_playing_xi(match_key, state)
-        logger.info("Playing XI skipped for %s — match underway", match_key)
-        return False
     if match_key not in state.toss_posted:
         logger.info("Playing XI skipped for %s — toss not posted yet", match_key)
+        return False
+    if _playing_xi_blocked_by_live(block, state, match_key):
+        if match_key in state.live_last and match_key not in state.toss_posted:
+            _abandon_playing_xi(match_key, state)
+        logger.info("Playing XI skipped for %s — match underway", match_key)
         return False
     return True
 
@@ -1247,9 +1259,60 @@ def _best_block_for_playing_xi(blocks: list[str], state: PostState) -> str | Non
         if block_match_phase(block, state=state) == "toss":
             return block
     for block in blocks:
-        if _toss_announced(block) and not _match_underway(block, state):
+        match_key = make_match_key(block)
+        if _toss_announced(block) and not _playing_xi_blocked_by_live(block, state, match_key):
             return block
     return None
+
+
+async def _ensure_toss_and_xi_before_live(
+    raw_data: str,
+    match_key: str,
+    page: Page,
+    config: dict[str, str],
+    state: PostState,
+    match_links: dict[str, str],
+    *,
+    posted_count: int,
+    xi_attempted: set[str],
+) -> int:
+    """Post toss (+ XI when ready) before the first live update for the same match."""
+    if match_key in state.toss_posted:
+        return posted_count
+
+    blocks = [
+        block
+        for block in normalize_match_blocks(raw_data)
+        if _eligible_tracked_block(block) and make_match_key(block) == match_key
+    ]
+    toss_block = next((block for block in blocks if _toss_announced(block)), None)
+    if not toss_block:
+        return posted_count
+
+    logger.info("Posting toss before live for %s", match_key)
+    if posted_count > 0:
+        logger.info("Waiting %ds before toss post", INTER_MATCH_POST_DELAY)
+        await asyncio.sleep(INTER_MATCH_POST_DELAY)
+
+    if await _publish_toss_update(
+        toss_block,
+        match_key,
+        config,
+        state,
+        page=page,
+        match_links=match_links,
+    ):
+        posted_count += 1
+        posted_count = await post_playing_xi_if_ready(
+            toss_block,
+            match_links,
+            page,
+            config,
+            state,
+            posted_count=posted_count,
+        )
+        xi_attempted.add(match_key)
+    return posted_count
 
 
 def _toss_announced(block: str) -> bool:
@@ -1486,7 +1549,9 @@ async def post_missed_toss_and_playing_xi(
             continue
 
         if not xi_block:
-            if any(_match_underway(b, state) for b in blocks):
+            if match_key not in state.toss_posted and any(
+                block_match_phase(block, state=state) in ("live", "result") for block in blocks
+            ):
                 _abandon_playing_xi(match_key, state)
             continue
 
@@ -2160,6 +2225,18 @@ async def run_cycle(
         for block, phase in candidates:
             match_key = make_match_key(block)
             logger.info("Evaluating %s fixture (%s)", phase, match_key)
+
+            if phase == "live" and match_key not in _post_state.toss_posted:
+                posted_count = await _ensure_toss_and_xi_before_live(
+                    raw_data,
+                    match_key,
+                    page,
+                    config,
+                    _post_state,
+                    match_links,
+                    posted_count=posted_count,
+                    xi_attempted=xi_attempted,
+                )
 
             if phase != "live" and not should_post_one_shot(block, phase, _post_state):
                 logger.info("Skipping %s (%s) — already posted", match_key, phase)
