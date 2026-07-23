@@ -1494,8 +1494,8 @@ def test_live_player_stats() -> bool:
 
         path = generate_match_image(info)
         with Image.open(path) as img:
-            img_ok = img.size == (1080, 900)
-        _status("Live image with player stats uses tall layout", img_ok, str(img.size))
+            img_ok = img.size == (1080, 1080)
+        _status("Live image with player stats uses premium layout", img_ok, str(img.size))
         path.unlink(missing_ok=True)
     except Exception as exc:
         _status("Live image with player stats uses tall layout", False, str(exc))
@@ -1668,6 +1668,114 @@ R Premadasa Stadium, Colombo
     )
 
 
+def test_premium_live_card(keep_image: bool = False) -> bool:
+    print("\n=== 3i0. Premium live card ===")
+    from PIL import Image
+
+    from match_image import LIVE_PREMIUM_HEIGHT, MatchUpdateInfo
+
+    premium_size = (1080, LIVE_PREMIUM_HEIGHT)
+    img_ok = True
+
+    first_info = parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live")
+    try:
+        first_path = generate_match_image(first_info)
+        with Image.open(first_path) as img:
+            first_ok = img.size == premium_size and first_path.stat().st_size >= 10_000
+        _status("First innings premium PNG", first_ok, str(first_path))
+        if not first_ok:
+            img_ok = False
+        elif keep_image:
+            print(f"       Saved first innings premium at: {first_path}")
+        else:
+            first_path.unlink(missing_ok=True)
+    except Exception as exc:
+        _status("First innings premium PNG", False, str(exc))
+        img_ok = False
+
+    chase_info = parse_match_block(SAMPLE_CHASE_ODI.strip(), "live")
+    try:
+        chase_path = generate_match_image(chase_info)
+        with Image.open(chase_path) as img:
+            chase_ok = (
+                img.size == premium_size
+                and chase_path.stat().st_size >= 10_000
+                and chase_info.score1
+                and chase_info.score2
+            )
+        _status("Chase premium PNG (both scores parsed)", chase_ok, str(chase_path))
+        if not chase_ok:
+            img_ok = False
+        elif keep_image:
+            print(f"       Saved chase premium at: {chase_path}")
+        else:
+            chase_path.unlink(missing_ok=True)
+    except Exception as exc:
+        _status("Chase premium PNG (both scores parsed)", False, str(exc))
+        img_ok = False
+
+    with_stats = parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live")
+    with_stats.batters = ["R. Sharma: 98* (122)", "S. Gill: 45 (52)"]
+    with_stats.bowlers = ["T. Boult: 1/51 (9.0)", "M. Santner: 0/28 (8.0)"]
+    with_stats.batting_team = with_stats.team1
+    with_stats.bowling_team = with_stats.team2
+    without_stats = parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live")
+    without_stats.batters = []
+    without_stats.bowlers = []
+    without_stats.match_key = f"{without_stats.match_key}|no-stats"
+
+    try:
+        stats_path = generate_match_image(with_stats)
+        plain_path = generate_match_image(without_stats)
+        with Image.open(stats_path) as stats_img, Image.open(plain_path) as plain_img:
+            panels_ok = (
+                stats_img.size == premium_size
+                and plain_img.size == premium_size
+                and stats_path.stat().st_size > plain_path.stat().st_size
+            )
+        _status("Stats panels increase output size", panels_ok, f"{stats_path.stat().st_size} vs {plain_path.stat().st_size}")
+        if not panels_ok:
+            img_ok = False
+        elif keep_image:
+            print(f"       Saved with-stats premium at: {stats_path}")
+        else:
+            stats_path.unlink(missing_ok=True)
+            plain_path.unlink(missing_ok=True)
+    except Exception as exc:
+        _status("Stats panels increase output size", False, str(exc))
+        img_ok = False
+
+    long_score_info = MatchUpdateInfo(
+        team1="Sri Lanka",
+        team2="West Indies",
+        series="Sri Lanka tour of West Indies 2026",
+        match_label="2nd Test",
+        format_tag="Test",
+        phase="live",
+        score1="22 & 549/9 & 92/2",
+        score2="499",
+        innings_status="live",
+        session_break="stumps",
+        test_day=4,
+        headline="Day 4 \u2014 Stumps: SL 22 & 549/9 & 92/2, WI 499",
+        match_key="sri-lanka-west-indies|TEST|2nd Test",
+    )
+    try:
+        stumps_path = generate_match_image(long_score_info)
+        with Image.open(stumps_path) as img:
+            stumps_ok = img.size == premium_size and stumps_path.stat().st_size >= 5_000
+        _status("Test stumps premium PNG", stumps_ok, str(stumps_path))
+        if not stumps_ok:
+            img_ok = False
+        elif not keep_image:
+            stumps_path.unlink(missing_ok=True)
+    except Exception as exc:
+        _status("Test stumps premium PNG", False, str(exc))
+        img_ok = False
+
+    return img_ok
+
+
 def test_innings_layouts(keep_image: bool = False) -> bool:
     print("\n=== 3i. Innings-aware live layouts ===")
     from PIL import Image
@@ -1708,7 +1816,7 @@ def test_innings_layouts(keep_image: bool = False) -> bool:
         try:
             path = generate_match_image(info)
             with Image.open(path) as img:
-                ok = img.size == (1080, 900) and path.stat().st_size >= 10_000
+                ok = img.size == (1080, 1080) and path.stat().st_size >= 10_000
             _status(f"Generate {label} layout PNG", ok, str(path))
             if not ok:
                 img_ok = False
@@ -1747,7 +1855,7 @@ def test_innings_layouts(keep_image: bool = False) -> bool:
     try:
         long_path = generate_match_image(long_score_info)
         with Image.open(long_path) as img_ls:
-            long_score_ok = img_ls.size[0] == 1080 and long_path.stat().st_size >= 5_000
+            long_score_ok = img_ls.size == (1080, 1080) and long_path.stat().st_size >= 5_000
         _status("Long Test score renders without clipping", long_score_ok, str(long_path))
         if long_score_ok and not keep_image:
             long_path.unlink(missing_ok=True)
@@ -2339,6 +2447,7 @@ async def run(args: argparse.Namespace) -> int:
     google_captain_ok = test_google_captain_lookup()
     toss_retry_ok = test_toss_retry_window()
     live_stats_ok = test_live_player_stats()
+    premium_live_ok = test_premium_live_card(keep_image=args.match_image)
     live_flow_ok = test_live_posting_flow()
     score_parse_ok = test_odi_overs_score_parsing()
     season_score_ok = test_season_score_rejection()
@@ -2381,6 +2490,7 @@ async def run(args: argparse.Namespace) -> int:
         and google_captain_ok
         and toss_retry_ok
         and live_stats_ok
+        and premium_live_ok
         and live_flow_ok
         and score_parse_ok
         and season_score_ok

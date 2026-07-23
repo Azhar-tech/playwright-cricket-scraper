@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 TRACKED_TEAMS = [
     "India",
@@ -298,6 +298,33 @@ LIVE_RR_Y = 390
 LIVE_FOOTER_Y = 440
 LIVE_STATS_Y = 500
 LIVE_STATS_LINE_H = 32
+
+STADIUM_ASSET = _BASE_DIR / "assets" / "stadium-silhouette.png"
+LIVE_PREMIUM_HEIGHT = 1080
+LIVE_PREMIUM_BG_TOP = "#0b1a12"
+LIVE_PREMIUM_BG_MID = "#0d1f18"
+LIVE_PREMIUM_BG_BOTTOM = "#0a1628"
+LIVE_PREMIUM_PANEL_BAT_BG = (16, 48, 32, 170)
+LIVE_PREMIUM_PANEL_BOWL_BG = (16, 32, 64, 170)
+LIVE_PREMIUM_TEXT = "#FFFFFF"
+LIVE_PREMIUM_MUTED = "#B0BEC5"
+LIVE_PREMIUM_SCORE = "#E8F5E9"
+LIVE_PREMIUM_BAT_ACCENT = "#4CAF50"
+LIVE_PREMIUM_BOWL_ACCENT = "#64B5F6"
+LIVE_PREMIUM_BADGE_RED = "#D93025"
+LIVE_PREMIUM_LEFT_CX = 200
+LIVE_PREMIUM_RIGHT_CX = 880
+LIVE_PREMIUM_CENTER_CX = 540
+LIVE_PREMIUM_FLAG_Y = 88
+LIVE_PREMIUM_TEAM_Y = 178
+LIVE_PREMIUM_CENTER_SCORE_Y = 210
+LIVE_PREMIUM_CENTER_OVERS_Y = 290
+LIVE_PREMIUM_PILL_Y = 400
+LIVE_PREMIUM_HEADLINE_Y = 470
+LIVE_PREMIUM_PANEL_TOP = 540
+LIVE_PREMIUM_PANEL_W = 480
+LIVE_PREMIUM_PANEL_H = 200
+LIVE_PREMIUM_PANEL_GAP = 40
 
 # ---------------------------------------------------------------------------
 # Toss card layout constants
@@ -2068,6 +2095,348 @@ def _update_footer_line(info: MatchUpdateInfo) -> str:
     return footer[:80]
 
 
+def _draw_live_stadium_background(width: int, height: int) -> Image.Image:
+    img = _draw_vertical_gradient(
+        width,
+        height,
+        LIVE_PREMIUM_BG_TOP,
+        LIVE_PREMIUM_BG_MID,
+        LIVE_PREMIUM_BG_BOTTOM,
+    )
+    if STADIUM_ASSET.exists():
+        try:
+            with Image.open(STADIUM_ASSET) as stadium:
+                stadium = stadium.convert("RGBA")
+                target_w = width
+                target_h = int(height * 0.72)
+                stadium = stadium.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                stadium = stadium.filter(ImageFilter.GaussianBlur(radius=2))
+                alpha = stadium.split()[3].point(lambda p: int(p * 0.35))
+                stadium.putalpha(alpha)
+                img.paste(stadium, (0, int(height * 0.12)), stadium)
+        except OSError:
+            pass
+    else:
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        for cx, cy, rx, ry in (
+            (width // 2, int(height * 0.55), width // 2, int(height * 0.28)),
+            (width // 4, int(height * 0.62), width // 5, int(height * 0.18)),
+            (3 * width // 4, int(height * 0.62), width // 5, int(height * 0.18)),
+        ):
+            draw.ellipse(
+                [(cx - rx, cy - ry), (cx + rx, cy + ry)],
+                fill=(255, 255, 255, 18),
+            )
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    return img
+
+
+def _draw_live_badge_premium(draw: ImageDraw.ImageDraw, badge_text: str, y: int) -> None:
+    font = _load_font(20, bold=True)
+    bbox = draw.textbbox((0, 0), badge_text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    pad_x, pad_y = 18, 8
+    pill_w = text_w + pad_x * 2
+    pill_h = text_h + pad_y * 2
+    cx = UPDATE_IMAGE_WIDTH // 2
+    pill_x = cx - pill_w // 2
+    pill_y = y
+    draw.rounded_rectangle(
+        [(pill_x, pill_y), (pill_x + pill_w, pill_y + pill_h)],
+        radius=pill_h // 2,
+        fill=LIVE_PREMIUM_BADGE_RED,
+    )
+    draw.text((pill_x + pad_x, pill_y + pad_y - 1), badge_text, font=font, fill=LIVE_PREMIUM_TEXT)
+    arc_y = pill_y + pill_h // 2
+    for side, sign in ((pill_x - 14, -1), (pill_x + pill_w + 14, 1)):
+        for offset in (0, 8, 16):
+            x0 = side + sign * offset
+            x1 = side + sign * (offset + 10)
+            draw.arc(
+                [(min(x0, x1) - 6, arc_y - 10), (max(x0, x1) + 6, arc_y + 10)],
+                start=270 if sign < 0 else 90,
+                end=90 if sign < 0 else 270,
+                fill=LIVE_PREMIUM_TEXT,
+                width=2,
+            )
+
+
+def _draw_premium_stats_panels(base: Image.Image, info: MatchUpdateInfo) -> Image.Image:
+    if not info.batters and not info.bowlers:
+        return base
+
+    overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, LIVE_PREMIUM_HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    panel_top = LIVE_PREMIUM_PANEL_TOP
+    left_x = (UPDATE_IMAGE_WIDTH - LIVE_PREMIUM_PANEL_W * 2 - LIVE_PREMIUM_PANEL_GAP) // 2
+    right_x = left_x + LIVE_PREMIUM_PANEL_W + LIVE_PREMIUM_PANEL_GAP
+
+    batting_team = info.batting_team or info.team1
+    bowling_team = info.bowling_team or info.team2
+
+    header_font = _load_font(22, bold=True)
+    line_font = _load_font(20, bold=False)
+
+    if info.batters:
+        draw.rounded_rectangle(
+            [(left_x, panel_top), (left_x + LIVE_PREMIUM_PANEL_W, panel_top + LIVE_PREMIUM_PANEL_H)],
+            radius=16,
+            fill=LIVE_PREMIUM_PANEL_BAT_BG,
+        )
+        draw.text(
+            (left_x + 20, panel_top + 16),
+            f"{_team_abbrev(batting_team)} batting",
+            font=header_font,
+            fill=LIVE_PREMIUM_BAT_ACCENT,
+        )
+        for idx, batter in enumerate(info.batters[:2]):
+            draw.text(
+                (left_x + 20, panel_top + 56 + idx * 34),
+                f"• {batter.lstrip('• ')}",
+                font=line_font,
+                fill=LIVE_PREMIUM_TEXT,
+            )
+
+    if info.bowlers:
+        draw.rounded_rectangle(
+            [(right_x, panel_top), (right_x + LIVE_PREMIUM_PANEL_W, panel_top + LIVE_PREMIUM_PANEL_H)],
+            radius=16,
+            fill=LIVE_PREMIUM_PANEL_BOWL_BG,
+        )
+        draw.text(
+            (right_x + 20, panel_top + 16),
+            f"{_team_abbrev(bowling_team)} bowling",
+            font=header_font,
+            fill=LIVE_PREMIUM_BOWL_ACCENT,
+        )
+        for idx, bowler in enumerate(info.bowlers[:2]):
+            line = bowler.rstrip(" •")
+            draw.text(
+                (right_x + 20, panel_top + 56 + idx * 34),
+                f"• {line.lstrip('• ')}",
+                font=line_font,
+                fill=LIVE_PREMIUM_TEXT,
+            )
+
+    return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+
+
+def _premium_team_label(team: str) -> str:
+    return team.replace(" Women", " WOMEN").upper()
+
+
+def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
+    img = _draw_live_stadium_background(UPDATE_IMAGE_WIDTH, LIVE_PREMIUM_HEIGHT)
+    draw = ImageDraw.Draw(img)
+
+    name_font = _load_font(22, bold=True)
+    status_font = _load_font(20, bold=False)
+    side_score_font = _load_font(28, bold=True)
+    side_overs_font = _load_font(18, bold=False)
+
+    left_flag = _load_team_flag(info.team1, UPDATE_FLAG_WIDTH, UPDATE_FLAG_HEIGHT, UPDATE_FLAG_RADIUS)
+    right_flag = _load_team_flag(info.team2, UPDATE_FLAG_WIDTH, UPDATE_FLAG_HEIGHT, UPDATE_FLAG_RADIUS)
+    _paste_flag_centered(img, left_flag, LIVE_PREMIUM_LEFT_CX, LIVE_PREMIUM_FLAG_Y)
+    _paste_flag_centered(img, right_flag, LIVE_PREMIUM_RIGHT_CX, LIVE_PREMIUM_FLAG_Y)
+
+    draw = ImageDraw.Draw(img)
+    _draw_live_badge_premium(draw, _live_badge_text(info), LIVE_BADGE_Y)
+    _draw_centered_text(
+        draw,
+        _premium_team_label(info.team1),
+        LIVE_PREMIUM_LEFT_CX,
+        LIVE_PREMIUM_TEAM_Y,
+        name_font,
+        LIVE_PREMIUM_TEXT,
+    )
+    _draw_centered_text(
+        draw,
+        _premium_team_label(info.team2),
+        LIVE_PREMIUM_RIGHT_CX,
+        LIVE_PREMIUM_TEAM_Y,
+        name_font,
+        LIVE_PREMIUM_TEXT,
+    )
+
+    is_chase = info.innings_status in ("chase", "innings_break") and info.score1 and info.score2
+    batting = info.batting_team or info.team1
+    if is_chase:
+        _draw_score_fitted(
+            draw,
+            info.score1 or "\u2014",
+            LIVE_PREMIUM_LEFT_CX,
+            LIVE_PREMIUM_CENTER_SCORE_Y - 10,
+            LIVE_PREMIUM_TEXT,
+            160,
+            max_size=40,
+        )
+        if info.overs1:
+            _draw_centered_text(
+                draw,
+                info.overs1,
+                LIVE_PREMIUM_LEFT_CX,
+                LIVE_PREMIUM_CENTER_OVERS_Y - 10,
+                side_overs_font,
+                LIVE_PREMIUM_MUTED,
+            )
+        _draw_score_fitted(
+            draw,
+            info.score2 or "\u2014",
+            LIVE_PREMIUM_RIGHT_CX,
+            LIVE_PREMIUM_CENTER_SCORE_Y - 10,
+            LIVE_PREMIUM_SCORE,
+            160,
+            max_size=40,
+        )
+        if info.overs2:
+            _draw_centered_text(
+                draw,
+                info.overs2,
+                LIVE_PREMIUM_RIGHT_CX,
+                LIVE_PREMIUM_CENTER_OVERS_Y - 10,
+                side_overs_font,
+                LIVE_PREMIUM_MUTED,
+            )
+        if info.headline:
+            _draw_centered_text(
+                draw,
+                info.headline[:72],
+                LIVE_PREMIUM_CENTER_CX,
+                LIVE_PREMIUM_CENTER_SCORE_Y + 8,
+                _load_font(24, bold=True),
+                LIVE_PREMIUM_TEXT,
+            )
+    else:
+        if batting == info.team1:
+            center_score = info.score1 or "\u2014"
+            center_overs = info.overs1
+            other_yet = not info.score2 or info.opponent_yet_to_bat
+        else:
+            center_score = info.score2 or "\u2014"
+            center_overs = info.overs2
+            other_yet = not info.score1 or info.opponent_yet_to_bat
+
+        _draw_score_fitted(
+            draw,
+            center_score,
+            LIVE_PREMIUM_CENTER_CX,
+            LIVE_PREMIUM_CENTER_SCORE_Y,
+            LIVE_PREMIUM_SCORE,
+            220,
+            max_size=64,
+        )
+        if center_overs:
+            _draw_centered_text(
+                draw,
+                center_overs,
+                LIVE_PREMIUM_CENTER_CX,
+                LIVE_PREMIUM_CENTER_OVERS_Y,
+                side_overs_font,
+                LIVE_PREMIUM_MUTED,
+            )
+
+        if other_yet:
+            other_cx = LIVE_PREMIUM_RIGHT_CX if batting == info.team1 else LIVE_PREMIUM_LEFT_CX
+            status = "Innings Break" if info.innings_status == "innings_break" else "Yet to Bat"
+            _draw_centered_text(
+                draw,
+                status,
+                other_cx,
+                LIVE_PREMIUM_CENTER_SCORE_Y + 18,
+                status_font,
+                LIVE_PREMIUM_MUTED,
+            )
+        elif info.score1 and info.score2:
+            if batting == info.team1:
+                _draw_score_fitted(
+                    draw,
+                    info.score2,
+                    LIVE_PREMIUM_RIGHT_CX,
+                    LIVE_PREMIUM_CENTER_SCORE_Y - 10,
+                    LIVE_PREMIUM_TEXT,
+                    160,
+                    max_size=36,
+                )
+                if info.overs2:
+                    _draw_centered_text(
+                        draw,
+                        info.overs2,
+                        LIVE_PREMIUM_RIGHT_CX,
+                        LIVE_PREMIUM_CENTER_OVERS_Y - 10,
+                        side_overs_font,
+                        LIVE_PREMIUM_MUTED,
+                    )
+            else:
+                _draw_score_fitted(
+                    draw,
+                    info.score1,
+                    LIVE_PREMIUM_LEFT_CX,
+                    LIVE_PREMIUM_CENTER_SCORE_Y - 10,
+                    LIVE_PREMIUM_TEXT,
+                    160,
+                    max_size=36,
+                )
+                if info.overs1:
+                    _draw_centered_text(
+                        draw,
+                        info.overs1,
+                        LIVE_PREMIUM_LEFT_CX,
+                        LIVE_PREMIUM_CENTER_OVERS_Y - 10,
+                        side_overs_font,
+                        LIVE_PREMIUM_MUTED,
+                    )
+
+    pill_text = _update_footer_line(info)
+    pill_font = _load_font(22, bold=False)
+    display = pill_text[:64]
+    bbox = draw.textbbox((0, 0), display, font=pill_font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    pad_x, pad_y = 28, 12
+    pill_w = min(text_w + pad_x * 2, UPDATE_IMAGE_WIDTH - 80)
+    pill_h = text_h + pad_y * 2
+    pill_x = (UPDATE_IMAGE_WIDTH - pill_w) // 2
+    pill_y = LIVE_PREMIUM_PILL_Y
+    pill_overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, LIVE_PREMIUM_HEIGHT), (0, 0, 0, 0))
+    pill_draw = ImageDraw.Draw(pill_overlay)
+    pill_draw.rounded_rectangle(
+        [(pill_x, pill_y), (pill_x + pill_w, pill_y + pill_h)],
+        radius=pill_h // 2,
+        fill=(255, 255, 255, 215),
+    )
+    img = Image.alpha_composite(img.convert("RGBA"), pill_overlay).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    _draw_centered_text(draw, display, UPDATE_IMAGE_WIDTH // 2, pill_y + pad_y - 1, pill_font, "#202124")
+
+    rr_parts = []
+    if info.current_run_rate:
+        rr_parts.append(f"CRR: {info.current_run_rate}")
+    if info.required_run_rate:
+        rr_parts.append(f"RRR: {info.required_run_rate}")
+    if rr_parts and is_chase:
+        _draw_centered_text(
+            draw,
+            " \u00b7 ".join(rr_parts),
+            LIVE_PREMIUM_CENTER_CX,
+            LIVE_PREMIUM_HEADLINE_Y,
+            _load_font(20, bold=False),
+            LIVE_PREMIUM_MUTED,
+        )
+    elif info.headline and not is_chase:
+        _draw_centered_text(
+            draw,
+            info.headline[:72],
+            LIVE_PREMIUM_CENTER_CX,
+            LIVE_PREMIUM_HEADLINE_Y,
+            _load_font(22, bold=False),
+            LIVE_PREMIUM_MUTED,
+        )
+
+    return _draw_premium_stats_panels(img, info)
+
+
 def _draw_live_player_stats(
     draw: ImageDraw.ImageDraw,
     info: MatchUpdateInfo,
@@ -3279,18 +3648,7 @@ def _draw_match_update_card(info: MatchUpdateInfo) -> Image.Image:
     if info.phase == "toss":
         return _draw_toss_card(info)
     if info.phase == "live":
-        if info.batters or info.bowlers:
-            if info.innings_status in ("chase", "innings_break"):
-                return _draw_chase_card(info)
-            return _draw_first_innings_card(info)
-        if info.session_break and info.score1 and info.score2:
-            return _draw_chase_card(info)
-        if info.innings_status == "first_innings":
-            return _draw_first_innings_card(info)
-        if info.innings_status in ("chase", "innings_break"):
-            return _draw_chase_card(info)
-        if info.session_break:
-            return _draw_first_innings_card(info)
+        return _draw_premium_live_card(info)
     return _draw_compact_update_card(info)
 
 
