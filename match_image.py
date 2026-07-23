@@ -300,7 +300,6 @@ LIVE_STATS_Y = 500
 LIVE_STATS_LINE_H = 32
 
 STADIUM_ASSET = _BASE_DIR / "assets" / "stadium-silhouette.png"
-LIVE_PREMIUM_HEIGHT = 1080
 LIVE_PREMIUM_BG_TOP = "#0b1a12"
 LIVE_PREMIUM_BG_MID = "#0d1f18"
 LIVE_PREMIUM_BG_BOTTOM = "#0a1628"
@@ -319,12 +318,15 @@ LIVE_PREMIUM_FLAG_Y = 88
 LIVE_PREMIUM_TEAM_Y = 178
 LIVE_PREMIUM_CENTER_SCORE_Y = 210
 LIVE_PREMIUM_CENTER_OVERS_Y = 290
-LIVE_PREMIUM_PILL_Y = 400
-LIVE_PREMIUM_HEADLINE_Y = 470
-LIVE_PREMIUM_PANEL_TOP = 540
+LIVE_PREMIUM_PILL_Y = 388
+LIVE_PREMIUM_HEADLINE_Y = 456
+LIVE_PREMIUM_PANEL_TOP = 512
 LIVE_PREMIUM_PANEL_W = 480
 LIVE_PREMIUM_PANEL_H = 200
 LIVE_PREMIUM_PANEL_GAP = 40
+LIVE_PREMIUM_BOTTOM_PAD = 36
+LIVE_PREMIUM_HEADLINE_LINE_H = 32
+LIVE_PREMIUM_PILL_LINE_H = 44
 
 # ---------------------------------------------------------------------------
 # Toss card layout constants
@@ -2163,11 +2165,23 @@ def _draw_live_badge_premium(draw: ImageDraw.ImageDraw, badge_text: str, y: int)
             )
 
 
+def _premium_live_card_height(info: MatchUpdateInfo) -> int:
+    if info.batters or info.bowlers:
+        return LIVE_PREMIUM_PANEL_TOP + LIVE_PREMIUM_PANEL_H + LIVE_PREMIUM_BOTTOM_PAD
+    is_chase = info.innings_status in ("chase", "innings_break") and info.score1 and info.score2
+    has_rr = is_chase and (info.current_run_rate or info.required_run_rate)
+    has_headline = bool(info.headline) and not is_chase
+    if has_rr or has_headline:
+        return LIVE_PREMIUM_HEADLINE_Y + LIVE_PREMIUM_HEADLINE_LINE_H + LIVE_PREMIUM_BOTTOM_PAD
+    return LIVE_PREMIUM_PILL_Y + LIVE_PREMIUM_PILL_LINE_H + LIVE_PREMIUM_BOTTOM_PAD
+
+
 def _draw_premium_stats_panels(base: Image.Image, info: MatchUpdateInfo) -> Image.Image:
     if not info.batters and not info.bowlers:
         return base
 
-    overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, LIVE_PREMIUM_HEIGHT), (0, 0, 0, 0))
+    height = base.height
+    overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     panel_top = LIVE_PREMIUM_PANEL_TOP
     left_x = (UPDATE_IMAGE_WIDTH - LIVE_PREMIUM_PANEL_W * 2 - LIVE_PREMIUM_PANEL_GAP) // 2
@@ -2228,7 +2242,8 @@ def _premium_team_label(team: str) -> str:
 
 
 def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
-    img = _draw_live_stadium_background(UPDATE_IMAGE_WIDTH, LIVE_PREMIUM_HEIGHT)
+    height = _premium_live_card_height(info)
+    img = _draw_live_stadium_background(UPDATE_IMAGE_WIDTH, height)
     draw = ImageDraw.Draw(img)
 
     name_font = _load_font(22, bold=True)
@@ -2399,7 +2414,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
     pill_h = text_h + pad_y * 2
     pill_x = (UPDATE_IMAGE_WIDTH - pill_w) // 2
     pill_y = LIVE_PREMIUM_PILL_Y
-    pill_overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, LIVE_PREMIUM_HEIGHT), (0, 0, 0, 0))
+    pill_overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, height), (0, 0, 0, 0))
     pill_draw = ImageDraw.Draw(pill_overlay)
     pill_draw.rounded_rectangle(
         [(pill_x, pill_y), (pill_x + pill_w, pill_y + pill_h)],

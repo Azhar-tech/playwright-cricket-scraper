@@ -1061,7 +1061,12 @@ def test_match_image_generation(keep_image: bool = False) -> bool:
         size_ok = False
         if path.exists():
             with Image.open(path) as img:
-                expected_h = 900 if phase == "live" else (540 if phase == "toss" else 720)
+                if phase == "live":
+                    from match_image import _premium_live_card_height
+
+                    expected_h = _premium_live_card_height(info)
+                else:
+                    expected_h = 540 if phase == "toss" else 720
                 size_ok = img.size == (1080, expected_h)
 
         ok = path.exists() and path.stat().st_size >= 10_000 and size_ok
@@ -1494,7 +1499,9 @@ def test_live_player_stats() -> bool:
 
         path = generate_match_image(info)
         with Image.open(path) as img:
-            img_ok = img.size == (1080, 1080)
+            from match_image import _premium_live_card_height
+
+            img_ok = img.size == (1080, _premium_live_card_height(info))
         _status("Live image with player stats uses premium layout", img_ok, str(img.size))
         path.unlink(missing_ok=True)
     except Exception as exc:
@@ -1672,17 +1679,17 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
     print("\n=== 3i0. Premium live card ===")
     from PIL import Image
 
-    from match_image import LIVE_PREMIUM_HEIGHT, MatchUpdateInfo
+    from match_image import MatchUpdateInfo, _premium_live_card_height
 
-    premium_size = (1080, LIVE_PREMIUM_HEIGHT)
     img_ok = True
 
     first_info = parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live")
+    first_expected = (1080, _premium_live_card_height(first_info))
     try:
         first_path = generate_match_image(first_info)
         with Image.open(first_path) as img:
-            first_ok = img.size == premium_size and first_path.stat().st_size >= 10_000
-        _status("First innings premium PNG", first_ok, str(first_path))
+            first_ok = img.size == first_expected and first_path.stat().st_size >= 10_000
+        _status("First innings premium PNG", first_ok, f"{img.size} expected {first_expected}")
         if not first_ok:
             img_ok = False
         elif keep_image:
@@ -1694,16 +1701,17 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
         img_ok = False
 
     chase_info = parse_match_block(SAMPLE_CHASE_ODI.strip(), "live")
+    chase_expected = (1080, _premium_live_card_height(chase_info))
     try:
         chase_path = generate_match_image(chase_info)
         with Image.open(chase_path) as img:
             chase_ok = (
-                img.size == premium_size
+                img.size == chase_expected
                 and chase_path.stat().st_size >= 10_000
                 and chase_info.score1
                 and chase_info.score2
             )
-        _status("Chase premium PNG (both scores parsed)", chase_ok, str(chase_path))
+        _status("Chase premium PNG (both scores parsed)", chase_ok, f"{img.size} expected {chase_expected}")
         if not chase_ok:
             img_ok = False
         elif keep_image:
@@ -1728,12 +1736,19 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
         stats_path = generate_match_image(with_stats)
         plain_path = generate_match_image(without_stats)
         with Image.open(stats_path) as stats_img, Image.open(plain_path) as plain_img:
+            stats_expected = (1080, _premium_live_card_height(with_stats))
+            plain_expected = (1080, _premium_live_card_height(without_stats))
             panels_ok = (
-                stats_img.size == premium_size
-                and plain_img.size == premium_size
+                stats_img.size == stats_expected
+                and plain_img.size == plain_expected
+                and stats_img.height > plain_img.height
                 and stats_path.stat().st_size > plain_path.stat().st_size
             )
-        _status("Stats panels increase output size", panels_ok, f"{stats_path.stat().st_size} vs {plain_path.stat().st_size}")
+        _status(
+            "Stats panels increase output size",
+            panels_ok,
+            f"{stats_img.size} vs {plain_img.size} ({stats_path.stat().st_size} vs {plain_path.stat().st_size})",
+        )
         if not panels_ok:
             img_ok = False
         elif keep_image:
@@ -1762,9 +1777,10 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
     )
     try:
         stumps_path = generate_match_image(long_score_info)
+        stumps_expected = (1080, _premium_live_card_height(long_score_info))
         with Image.open(stumps_path) as img:
-            stumps_ok = img.size == premium_size and stumps_path.stat().st_size >= 5_000
-        _status("Test stumps premium PNG", stumps_ok, str(stumps_path))
+            stumps_ok = img.size == stumps_expected and stumps_path.stat().st_size >= 5_000
+        _status("Test stumps premium PNG", stumps_ok, f"{img.size} expected {stumps_expected}")
         if not stumps_ok:
             img_ok = False
         elif not keep_image:
@@ -1779,6 +1795,8 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
 def test_innings_layouts(keep_image: bool = False) -> bool:
     print("\n=== 3i. Innings-aware live layouts ===")
     from PIL import Image
+
+    from match_image import MatchUpdateInfo, _premium_live_card_height
 
     first_info = parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live")
     first_ok = (
@@ -1816,8 +1834,9 @@ def test_innings_layouts(keep_image: bool = False) -> bool:
         try:
             path = generate_match_image(info)
             with Image.open(path) as img:
-                ok = img.size == (1080, 1080) and path.stat().st_size >= 10_000
-            _status(f"Generate {label} layout PNG", ok, str(path))
+                expected = (1080, _premium_live_card_height(info))
+                ok = img.size == expected and path.stat().st_size >= 10_000
+            _status(f"Generate {label} layout PNG", ok, f"{img.size} expected {expected}")
             if not ok:
                 img_ok = False
             elif keep_image:
@@ -1855,8 +1874,9 @@ def test_innings_layouts(keep_image: bool = False) -> bool:
     try:
         long_path = generate_match_image(long_score_info)
         with Image.open(long_path) as img_ls:
-            long_score_ok = img_ls.size == (1080, 1080) and long_path.stat().st_size >= 5_000
-        _status("Long Test score renders without clipping", long_score_ok, str(long_path))
+            long_expected = (1080, _premium_live_card_height(long_score_info))
+            long_score_ok = img_ls.size == long_expected and long_path.stat().st_size >= 5_000
+        _status("Long Test score renders without clipping", long_score_ok, f"{img_ls.size} expected {long_expected}")
         if long_score_ok and not keep_image:
             long_path.unlink(missing_ok=True)
     except Exception as exc:
