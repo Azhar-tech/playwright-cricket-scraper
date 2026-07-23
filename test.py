@@ -25,8 +25,12 @@ from match_image import (
     _abbrev_dismissal,
     _extract_time,
     _extract_venue_from_line,
+    _is_score_line,
+    _is_valid_cricket_score,
     _load_font,
     _parse_score_line,
+    block_contains_valid_score,
+    block_has_valid_live_score,
     build_live_caption,
     build_preview_caption,
     build_result_caption,
@@ -1320,6 +1324,199 @@ def test_toss_fallback() -> bool:
     return ok
 
 
+def test_google_captain_lookup() -> bool:
+    print("\n=== 3g6. Google captain lookup ===")
+    from captain_toss import (
+        _extract_captain_name_from_text,
+        _format_captain_query,
+        _normalize_captain_name,
+        try_build_captain_toss_info,
+    )
+
+    ok_query = _format_captain_query("India", "T20") == "India T20I cricket team captain"
+    ok_women = (
+        _format_captain_query("Sri Lanka Women", "ODI")
+        == "Sri Lanka Women ODI cricket team captain"
+    )
+    _status("Format-aware captain query", ok_query and ok_women)
+
+    ok_extract = (
+        _extract_captain_name_from_text("The current captain is Hardik Pandya", "India")
+        == "Hardik Pandya"
+    )
+    _status("Extract captain from snippet", ok_extract)
+
+    ok_norm = (
+        _normalize_captain_name("Hardik Pandya - India T20I captain", "India") == "Hardik Pandya"
+    )
+    _status("Normalize captain name", ok_norm)
+
+    async def _run_mock() -> bool:
+        from unittest.mock import AsyncMock, patch
+
+        info = parse_match_block(SAMPLE_TOSS_BLOCK.strip(), "toss")
+        buttler_path = _ensure_fixture_headshot("Jos Buttler", (30, 80, 160))
+        rohit_path = _ensure_fixture_headshot("Rohit Sharma", (180, 40, 40))
+        with patch("captain_toss.lookup_captain_name_via_google", new_callable=AsyncMock) as google:
+            with patch("captain_toss.fetch_captain_headshot", new_callable=AsyncMock) as headshot:
+                google.side_effect = (
+                    lambda page, team, fmt: "Jos Buttler" if team == "England" else "Rohit Sharma"
+                )
+                headshot.side_effect = (
+                    lambda page, name, team: buttler_path if "Buttler" in name else rohit_path
+                )
+                result = await try_build_captain_toss_info(None, None, info, "T20")
+                return (
+                    result is not None
+                    and result.team1_captain.name == "Jos Buttler"
+                    and result.team2_captain.name == "Rohit Sharma"
+                )
+
+    mock_ok = asyncio.run(_run_mock())
+    _status("try_build uses Google names without ESPN", mock_ok)
+
+    return all([ok_query, ok_women, ok_extract, ok_norm, mock_ok])
+
+
+def test_toss_retry_window() -> bool:
+    print("\n=== 3g7. Captain toss retry window ===")
+    from datetime import datetime, timedelta
+
+    from main import (
+        CAPTAIN_TOSS_RETRY_SECONDS,
+        _captain_toss_pending_remaining,
+        _captain_toss_should_wait,
+        _generate_toss_image_or_wait,
+    )
+
+    state = PostState()
+    match_key = "test-match"
+
+    ok_first = _captain_toss_should_wait(match_key, state)
+    _status("First attempt should wait", ok_first)
+
+    state.toss_captain_pending_at[match_key] = datetime.now().isoformat()
+    ok_recent = _captain_toss_should_wait(match_key, state)
+    _status("Recent pending should wait", ok_recent)
+
+    old = datetime.now() - timedelta(seconds=CAPTAIN_TOSS_RETRY_SECONDS + 1)
+    state.toss_captain_pending_at[match_key] = old.isoformat()
+    ok_expired = not _captain_toss_should_wait(match_key, state)
+    _status("Expired pending should not wait", ok_expired)
+
+    remaining = _captain_toss_pending_remaining(match_key, state)
+    ok_remaining = remaining == 0.0
+    _status("Expired pending has 0s remaining", ok_remaining)
+
+    async def _run_wait() -> bool:
+        from unittest.mock import AsyncMock, patch
+
+        state2 = PostState()
+        block = SAMPLE_TOSS_BLOCK.strip()
+        mk = make_match_key(block)
+        info = parse_match_block(block, "toss")
+        with patch("main.try_build_captain_toss_info", new_callable=AsyncMock) as build:
+            build.return_value = None
+            path = await _generate_toss_image_or_wait(None, block, mk, {}, info, state2)
+            return path is None and mk in state2.toss_captain_pending_at
+
+    wait_ok = asyncio.run(_run_wait())
+    _status("Generate toss returns None while waiting", wait_ok)
+
+    return all([ok_first, ok_recent, ok_expired, ok_remaining, wait_ok])
+
+
+SAMPLE_LIVE_STATS_JSON = """
+<script id="__NEXT_DATA__" type="application/json">{
+  "match": {
+    "innings": [{
+      "batsmen": [
+        {"player": {"name": "Wessly Madhevere"}, "runs": 30, "balls": 28, "isStriker": true},
+        {"player": {"name": "Tadiwanashe Marumani"}, "runs": 10, "balls": 9}
+      ],
+      "bowlers": [
+        {"player": {"name": "Ashok Sharma"}, "wickets": 0, "runsConceded": 29, "overs": 4.0},
+        {"player": {"name": "Ravi Bishnoi"}, "wickets": 1, "runsConceded": 24, "overs": 3.5, "isActive": true}
+      ]
+    }]
+  }
+}</script>
+"""
+
+
+def test_live_player_stats() -> bool:
+    print("\n=== 3g8. Live batter/bowler stats ===")
+    from live_player_stats import (
+        abbrev_player_name,
+        format_batter_line,
+        format_bowler_line,
+        parse_live_player_stats_from_html,
+        parse_live_player_stats_from_next_data,
+    )
+
+    ok_batter_fmt = format_batter_line("Wessly Madhevere", 30, 28, True, is_striker=True) == (
+        "• W. Madhevere: 30* (28)"
+    )
+    _status("Batter line format", ok_batter_fmt)
+
+    ok_bowler_fmt = format_bowler_line("Ravi Bishnoi", 1, 24, 3.5, is_active=True) == (
+        "R. Bishnoi: 1/24 (3.5) •"
+    )
+    _status("Bowler line format", ok_bowler_fmt)
+
+    ok_abbrev = abbrev_player_name("Hardik Pandya") == "H. Pandya"
+    _status("Abbreviate player name", ok_abbrev)
+
+    batters, bowlers = parse_live_player_stats_from_next_data(SAMPLE_LIVE_STATS_JSON)
+    ok_json = (
+        len(batters) == 2
+        and batters[0].name == "Wessly Madhevere"
+        and batters[0].is_striker
+        and len(bowlers) == 2
+        and any(b.name == "Ravi Bishnoi" for b in bowlers)
+    )
+    _status("Parse batters/bowlers from NEXT_DATA", ok_json)
+
+    lines_b, lines_w = parse_live_player_stats_from_html(SAMPLE_LIVE_STATS_JSON, "")
+    ok_lines = (
+        any("Madhevere" in line for line in lines_b)
+        and any("Bishnoi" in line for line in lines_w)
+    )
+    _status("Formatted live stat lines", ok_lines, f"{lines_b} | {lines_w}")
+
+    info = parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live")
+    info.batters = lines_b or ["R. Sharma: 98* (122)"]
+    info.bowlers = lines_w or ["T. Boult: 1/51 (9.0)"]
+    info.batting_team = info.team1
+    info.bowling_team = info.team2
+    try:
+        from PIL import Image
+
+        path = generate_match_image(info)
+        with Image.open(path) as img:
+            img_ok = img.size == (1080, 900)
+        _status("Live image with player stats uses tall layout", img_ok, str(img.size))
+        path.unlink(missing_ok=True)
+    except Exception as exc:
+        _status("Live image with player stats uses tall layout", False, str(exc))
+        img_ok = False
+
+    async def _run_skip_fetch() -> bool:
+        from unittest.mock import AsyncMock, patch
+
+        from main import _enrich_live_player_stats
+
+        info2 = parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live")
+        with patch("main.fetch_live_player_stats", new_callable=AsyncMock) as fetch:
+            await _enrich_live_player_stats(None, info2, "test", {"test": "http://example.com"})
+            return fetch.await_count == 0
+
+    skip_ok = asyncio.run(_run_skip_fetch())
+    _status("Skip ESPN fetch when block already has stats", skip_ok)
+
+    return all([ok_batter_fmt, ok_bowler_fmt, ok_abbrev, ok_json, ok_lines, img_ok, skip_ok])
+
+
 def test_live_posting_flow() -> bool:
     print("\n=== 3h. Live posting flow ===")
     toss_only = SAMPLE_TOSS_BLOCK.strip()
@@ -1411,6 +1608,64 @@ def test_odi_overs_score_parsing() -> bool:
     _status("Simple overs format still parses", ok_c, f"{score_c} {overs_c}")
 
     return ok_a and ok_b and ok_c
+
+
+def test_season_score_rejection() -> bool:
+    print("\n=== 3h3. Season score rejection ===")
+    tour_line = "Pakistan Women tour of Sri Lanka 2023/24"
+    ok_tour_line = not _is_score_line(tour_line)
+    tour_score, tour_overs = _parse_score_line(tour_line)
+    ok_tour_parse = tour_score == "" and tour_overs == ""
+    _status(
+        "Tour season line rejected",
+        ok_tour_line and ok_tour_parse,
+        f"is_score={_is_score_line(tour_line)} score={tour_score!r}",
+    )
+
+    score_a, overs_a = _parse_score_line("45/2 (10.2 ov)")
+    ok_a = score_a == "45/2" and overs_a == "(10.2)"
+    _status("45/2 with overs parses", ok_a, f"{score_a} {overs_a}")
+
+    ok_valid = _is_valid_cricket_score("184/2")
+    _status("184/2 is valid cricket score", ok_valid)
+
+    score_b, overs_b = _parse_score_line("50/5 (47.5/50 ov)")
+    ok_b = score_b == "50/5" and overs_b == "(47.5)"
+    _status("50/5 ODI overs still valid", ok_b, f"{score_b} {overs_b}")
+
+    season_block = """
+LIVE
+Sri Lanka Women
+Pakistan Women
+Pakistan Women tour of Sri Lanka 2023/24
+R Premadasa Stadium, Colombo
+""".strip()
+    live_info = parse_match_block(season_block, "live")
+    ok_block = live_info.score1 == "" and "2023/24" not in live_info.headline
+    _status(
+        "Season-only live block has empty score1",
+        ok_block,
+        f"score1={live_info.score1!r} headline={live_info.headline!r}",
+    )
+
+    ok_gate = not block_has_valid_live_score(season_block)
+    _status("block_has_valid_live_score on season block", ok_gate)
+
+    ok_contains = not block_contains_valid_score(season_block)
+    _status("block_contains_valid_score on season block", ok_contains)
+
+    return all(
+        [
+            ok_tour_line,
+            ok_tour_parse,
+            ok_a,
+            ok_valid,
+            ok_b,
+            ok_block,
+            ok_gate,
+            ok_contains,
+        ]
+    )
 
 
 def test_innings_layouts(keep_image: bool = False) -> bool:
@@ -2081,8 +2336,12 @@ async def run(args: argparse.Namespace) -> int:
     toss_before_live_ok = test_toss_before_live_order()
     captain_toss_ok = test_captain_toss_image(keep_image=args.match_image)
     toss_fallback_ok = test_toss_fallback()
+    google_captain_ok = test_google_captain_lookup()
+    toss_retry_ok = test_toss_retry_window()
+    live_stats_ok = test_live_player_stats()
     live_flow_ok = test_live_posting_flow()
     score_parse_ok = test_odi_overs_score_parsing()
+    season_score_ok = test_season_score_rejection()
     innings_layout_ok = test_innings_layouts(keep_image=args.match_image)
     playing_xi_ok = test_playing_xi(keep_image=args.playing_xi_image)
     playing_xi_trigger_ok = test_playing_xi_triggers()
@@ -2119,8 +2378,12 @@ async def run(args: argparse.Namespace) -> int:
         and toss_before_live_ok
         and captain_toss_ok
         and toss_fallback_ok
+        and google_captain_ok
+        and toss_retry_ok
+        and live_stats_ok
         and live_flow_ok
         and score_parse_ok
+        and season_score_ok
         and innings_layout_ok
         and playing_xi_ok
         and playing_xi_trigger_ok

@@ -11,13 +11,29 @@ import requests
 from playwright.async_api import Page
 
 from match_image import CaptainInfo, CaptainTossInfo, MatchUpdateInfo
-from playing_xi import captain_display_name, captains_from_squads
+from playing_xi import (
+    PlayingXiPlayer,
+    captain_display_name,
+    captains_from_squads,
+    find_team_captain,
+)
 
 logger = logging.getLogger(__name__)
 
 _BASE_DIR = Path(__file__).resolve().parent
 CAPTAIN_CACHE_DIR = _BASE_DIR / "assets" / "captain_cache"
+CAPTAIN_NAME_CACHE_DIR = CAPTAIN_CACHE_DIR / "names"
 GENERATED_IMAGES_DIR = _BASE_DIR / "generated_images"
+
+_FORMAT_LABELS = {"T20": "T20I", "ODI": "ODI", "TEST": "Test"}
+_NAME_NOISE = re.compile(
+    r"\b(?:captain|skipper|cricket|team|squad|profile|wikipedia|espn|cricinfo|"
+    r"current|who is|the|of|and|vs|v)\b",
+    re.IGNORECASE,
+)
+_PERSON_NAME = re.compile(
+    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b"
+)
 
 
 def _player_cache_slug(name: str) -> str:
@@ -25,8 +41,55 @@ def _player_cache_slug(name: str) -> str:
     return slug[:80] or "captain"
 
 
+def _team_format_slug(team: str, fmt: str) -> str:
+    return f"{_player_cache_slug(team)}-{_player_cache_slug(fmt)}"
+
+
 def _cached_headshot_path(name: str) -> Path:
     return CAPTAIN_CACHE_DIR / f"{_player_cache_slug(name)}.jpg"
+
+
+def _cached_captain_name_path(team: str, fmt: str) -> Path:
+    return CAPTAIN_NAME_CACHE_DIR / f"{_team_format_slug(team, fmt)}.txt"
+
+
+def _format_captain_query(team: str, fmt: str) -> str:
+    label = _FORMAT_LABELS.get(fmt, "cricket")
+    return f"{team} {label} cricket team captain"
+
+
+def _normalize_captain_name(raw: str, team: str) -> str:
+    cleaned = raw.strip()
+    cleaned = re.sub(r"\s*[-–|•]\s*.*$", "", cleaned)
+    cleaned = _NAME_NOISE.sub(" ", cleaned)
+    team_base = team.replace(" Women", "")
+    for token in (team, team_base, f"{team_base} Women"):
+        cleaned = re.sub(re.escape(token), "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,-")
+    if not cleaned:
+        return ""
+    parts = cleaned.split()
+    if len(parts) > 4:
+        cleaned = " ".join(parts[:4])
+    return cleaned.title()
+
+
+def _extract_captain_name_from_text(text: str, team: str) -> str:
+    if not text:
+        return ""
+    lower = text.lower()
+    for marker in ("captain is", "captain:", "skipper is", "skipper:", "captain -", "captain –"):
+        idx = lower.find(marker)
+        if idx >= 0:
+            fragment = text[idx + len(marker) : idx + len(marker) + 80]
+            name = _normalize_captain_name(fragment, team)
+            if name:
+                return name
+    for match in _PERSON_NAME.finditer(text):
+        name = _normalize_captain_name(match.group(1), team)
+        if name and len(name.split()) >= 2:
+            return name
+    return ""
 
 
 def captain_toss_ready(captains: CaptainTossInfo | None) -> bool:
@@ -53,6 +116,76 @@ def _download_image(url: str, dest: Path) -> bool:
     except Exception as exc:
         logger.warning("Captain headshot download failed for %s: %s", url[:80], exc)
         return False
+
+
+async def lookup_captain_name_via_google(page: Page, team: str, fmt: str) -> str | None:
+    """Look up the current format captain via Google text search."""
+    cache_path = _cached_captain_name_path(team, fmt)
+    if cache_path.exists():
+        cached = cache_path.read_text(encoding="utf-8").strip()
+        if cached:
+            logger.info("Using cached captain name for %s (%s): %s", team, fmt, cached)
+            return cached
+
+    query = _format_captain_query(team, fmt)
+    search_url = f"https://www.google.com/search?q={quote_plus(query)}"
+
+    try:
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception as exc:
+        logger.warning("Google captain search navigation failed for %s: %s", team, exc)
+        return None
+
+    if "google.com/sorry" in page.url:
+        logger.warning("Google CAPTCHA during captain name search for %s", team)
+        return None
+
+    snippet = await page.evaluate(
+        """
+        () => {
+          const selectors = [
+            '[data-attrid="title"]',
+            '.wDYxhc',
+            '.kp-header',
+            '.Z0LcW',
+            '.hgKElc',
+            '.LGOjhe',
+            '[data-tts="answers"]',
+            '.VwiC3b',
+            '.kno-rdesc span',
+          ];
+          for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.textContent && el.textContent.trim().length > 3) {
+              return el.textContent.trim();
+            }
+          }
+          const headings = Array.from(document.querySelectorAll('h3'));
+          for (const h3 of headings) {
+            const text = (h3.textContent || '').trim();
+            if (text.length >= 5 && text.length <= 60) return text;
+          }
+          return '';
+        }
+        """
+    )
+
+    name = _extract_captain_name_from_text(snippet if isinstance(snippet, str) else "", team)
+    if not name:
+        try:
+            body_text = await page.locator("body").inner_text(timeout=5000)
+        except Exception:
+            body_text = ""
+        name = _extract_captain_name_from_text(body_text[:2500], team)
+
+    if not name:
+        logger.info("No Google captain name result for %s (%s)", team, fmt)
+        return None
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(name, encoding="utf-8")
+    logger.info("Captain name from Google: %s -> %s", team, name)
+    return name
 
 
 async def fetch_captain_headshot(page: Page, name: str, team: str) -> Path | None:
@@ -109,37 +242,70 @@ async def fetch_captain_headshot(page: Page, name: str, team: str) -> Path | Non
     return None
 
 
-async def try_build_captain_toss_info(
+def _resolve_captain_name_from_espn(
+    team: str,
+    squads: dict[str, list[PlayingXiPlayer]],
+) -> str | None:
+    players = squads.get(team)
+    if not players:
+        return None
+    captain = find_team_captain(players)
+    if not captain:
+        return None
+    espn_name = captain_display_name(captain)
+    logger.info("Captain name from ESPN XI: %s -> %s", team, espn_name)
+    return espn_name
+
+
+async def _build_captain_toss_info(
     page: Page,
-    match_url: str,
     update_info: MatchUpdateInfo,
-) -> CaptainTossInfo | None:
-    """Build captain toss metadata from ESPN squads and Google headshots."""
-    if not match_url:
-        logger.info("Captain toss skip: no ESPN match URL")
-        return None
-
-    from main import fetch_playing_xi  # lazy import avoids circular dependency
-
+    captain_names: dict[str, str],
+) -> CaptainTossInfo:
     team1, team2 = update_info.team1, update_info.team2
-    squads = await fetch_playing_xi(page, match_url, team1, team2)
-    captain_players = captains_from_squads(squads, team1, team2)
-    if team1 not in captain_players or team2 not in captain_players:
-        logger.info(
-            "Captain toss skip: missing captain in squads (%s, %s)",
-            team1 in captain_players,
-            team2 in captain_players,
-        )
-        return None
-
     captains: dict[str, CaptainInfo] = {}
     for team in (team1, team2):
-        player = captain_players[team]
-        display_name = captain_display_name(player)
+        display_name = captain_names[team]
         image_path = await fetch_captain_headshot(page, display_name, team)
         captains[team] = CaptainInfo(team=team, name=display_name, image_path=image_path)
-
     return CaptainTossInfo(
         team1_captain=captains[team1],
         team2_captain=captains[team2],
     )
+
+
+async def try_build_captain_toss_info(
+    page: Page,
+    match_url: str | None,
+    update_info: MatchUpdateInfo,
+    fmt: str,
+) -> CaptainTossInfo | None:
+    """Build captain toss metadata: Google captain names first, ESPN XI fallback."""
+    team1, team2 = update_info.team1, update_info.team2
+    if not team1 or not team2:
+        return None
+
+    squads: dict[str, list[PlayingXiPlayer]] = {}
+    captain_names: dict[str, str] = {}
+
+    for team in (team1, team2):
+        name = await lookup_captain_name_via_google(page, team, fmt)
+        if name:
+            captain_names[team] = name
+
+    missing = [team for team in (team1, team2) if team not in captain_names]
+    if missing and match_url:
+        from main import fetch_playing_xi  # lazy import avoids circular dependency
+
+        squads = await fetch_playing_xi(page, match_url, team1, team2)
+        for team in missing:
+            name = _resolve_captain_name_from_espn(team, squads)
+            if name:
+                captain_names[team] = name
+
+    for team in (team1, team2):
+        if team not in captain_names:
+            logger.info("Captain toss skip: no captain name for %s after Google+ESPN", team)
+            return None
+
+    return await _build_captain_toss_info(page, update_info, captain_names)

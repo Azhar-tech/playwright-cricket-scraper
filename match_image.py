@@ -188,6 +188,8 @@ DATE_RANGE_PATTERN = re.compile(
 )
 FORMAT_PATTERN = re.compile(r"\b(T20I?|ODI|One\s*Day|Test)\b", re.IGNORECASE)
 SCORE_PATTERN = re.compile(r"\d+/\d+")
+SEASON_SCORE_PATTERN = re.compile(r"^(19|20)\d{2}/\d{2}$")
+NON_SCORE_CONTEXT = re.compile(r"\b(?:tour|season|championship)\b", re.IGNORECASE)
 CRICKET_IRELAND_ORG = re.compile(r"cricket\s+ireland", re.IGNORECASE)
 TOSS_PATTERN = re.compile(
     r"([\w ]+ won the toss[^.\n]*|[\w -]+ (?:chose|opted|elected) to (?:bat|field|bowl)[^.\n]*)",
@@ -560,11 +562,68 @@ def _teams_from_block(block: str) -> list[str]:
     return [_normalize_team_name(line) for line in block.splitlines() if _line_is_tracked_team(line)]
 
 
+def _is_valid_cricket_score(score: str) -> bool:
+    """True for runs/wickets (e.g. 184/2), false for seasons like 2023/24."""
+    cleaned = score.strip()
+    if not cleaned:
+        return False
+    if SEASON_SCORE_PATTERN.match(cleaned):
+        return False
+    match = re.match(r"^(\d+)/(\d+)$", cleaned)
+    if not match:
+        if re.fullmatch(r"\d+", cleaned):
+            return int(cleaned) <= 999
+        return False
+    runs, wickets = int(match.group(1)), int(match.group(2))
+    if wickets > 10:
+        return False
+    if runs >= 1900 or runs > 999:
+        return False
+    return True
+
+
+def _extract_valid_scores_from_line(line: str) -> list[str]:
+    masked = OVERS_PATTERN.sub(" ", line)
+    return [score for score in SCORE_PATTERN.findall(masked) if _is_valid_cricket_score(score)]
+
+
+def _line_is_non_score_context(line: str) -> bool:
+    lower = line.lower()
+    if not NON_SCORE_CONTEXT.search(lower):
+        return False
+    if OVERS_PATTERN.search(line) or SIMPLE_OVERS_PATTERN.search(line) or re.search(r"\bov\b", lower):
+        return False
+    return True
+
+
+def block_contains_valid_score(block: str) -> bool:
+    for line in block.splitlines():
+        if _extract_valid_scores_from_line(line.strip()):
+            return True
+    return False
+
+
+def block_has_valid_live_score(block: str) -> bool:
+    if _scores_by_team_detailed(block):
+        return True
+    target, runs_needed, _, overs_remaining = _parse_chase_meta(block)
+    if target is not None or runs_needed is not None or overs_remaining:
+        return True
+    if TARGET_PATTERN.search(block):
+        return True
+    for line in block.splitlines():
+        if CRR_PATTERN.search(line) and _extract_valid_scores_from_line(line):
+            return True
+    return False
+
+
 def _is_score_line(line: str) -> bool:
     lower = line.lower()
     if "won by" in lower or "won the toss" in lower:
         return False
-    if SCORE_PATTERN.search(line):
+    if _line_is_non_score_context(line):
+        return False
+    if _extract_valid_scores_from_line(line):
         return True
     if "&" in line and re.search(r"\d", line):
         return True
@@ -583,7 +642,7 @@ def _parse_score_line(line: str, *, innings_complete: bool = False) -> tuple[str
     target_match = TARGET_PATTERN.search(line)
     # Mask overs fractions (e.g. 47.5/50 ov) so they are not mistaken for scores
     masked = OVERS_PATTERN.sub(" ", line)
-    scores = SCORE_PATTERN.findall(masked)
+    scores = [score for score in SCORE_PATTERN.findall(masked) if _is_valid_cricket_score(score)]
 
     if "&" in line:
         parts = re.findall(r"\d+(?:/\d+)?", line)
@@ -1033,7 +1092,7 @@ def _scores_by_team_detailed(block: str) -> list[tuple[str, str, str]]:
                     except ValueError:
                         innings_complete = False
                 score, overs = _parse_score_line(nxt, innings_complete=innings_complete)
-                if score:
+                if score and _is_valid_cricket_score(score):
                     paired.append((team, score, overs))
                 break
     return paired
@@ -2017,6 +2076,9 @@ def _draw_live_player_stats(
 ) -> None:
     if not info.bowlers and not info.batters:
         return
+
+    divider_y = LIVE_STATS_Y - 14
+    draw.line([(80, divider_y), (UPDATE_IMAGE_WIDTH - 80, divider_y)], fill="#E0E0E0", width=1)
 
     bowling_x = UPDATE_LEFT_X - 60
     batting_x = UPDATE_RIGHT_X - 60
@@ -3217,6 +3279,10 @@ def _draw_match_update_card(info: MatchUpdateInfo) -> Image.Image:
     if info.phase == "toss":
         return _draw_toss_card(info)
     if info.phase == "live":
+        if info.batters or info.bowlers:
+            if info.innings_status in ("chase", "innings_break"):
+                return _draw_chase_card(info)
+            return _draw_first_innings_card(info)
         if info.session_break and info.score1 and info.score2:
             return _draw_chase_card(info)
         if info.innings_status == "first_innings":

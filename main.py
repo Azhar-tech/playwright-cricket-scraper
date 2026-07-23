@@ -89,6 +89,8 @@ from playwright_stealth import Stealth
 from match_image import (
     MatchUpdateInfo,
     ScorecardInfo,
+    block_contains_valid_score,
+    block_has_valid_live_score,
     build_preview_caption,
     build_scorecard_caption,
     build_update_caption,
@@ -106,6 +108,7 @@ from match_image import (
     scorecard_parse_valid,
 )
 from captain_toss import captain_toss_ready, try_build_captain_toss_info
+from live_player_stats import fetch_live_player_stats
 from playing_xi import (
     PlayingXiPlayer,
     build_playing_xi_caption,
@@ -179,6 +182,7 @@ INTER_MATCH_POST_DELAY = 60  # 1 minute between posts in the same cycle
 PLAYING_XI_AFTER_TOSS_DELAY = 150  # seconds after toss before first XI post
 PLAYING_XI_TEAM_DELAY = 60  # seconds between team 1 and team 2 XI posts
 PLAYING_XI_PENDING_INTERVAL = max(180, PLAYING_XI_AFTER_TOSS_DELAY + 60)
+CAPTAIN_TOSS_RETRY_SECONDS = 600  # wait up to 10 minutes for captain graphic before flag fallback
 FACEBOOK_BG_CHAR_LIMIT = 130
 
 FACEBOOK_BG_PRESETS = [
@@ -327,6 +331,7 @@ class PostState:
     test_session_posted: set[str] = field(default_factory=set)
     scorecard_innings_posted: set[str] = field(default_factory=set)
     toss_posted_at: dict[str, str] = field(default_factory=dict)
+    toss_captain_pending_at: dict[str, str] = field(default_factory=dict)
     live_last: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
@@ -362,6 +367,7 @@ def load_post_state() -> PostState:
             state.test_session_posted = set(data.get("test_session_posted", []))
             state.scorecard_innings_posted = set(data.get("scorecard_innings_posted", []))
             state.toss_posted_at = dict(data.get("toss_posted_at", {}))
+            state.toss_captain_pending_at = dict(data.get("toss_captain_pending_at", {}))
             state.live_last = dict(data.get("live_last", {}))
             return state
         except (json.JSONDecodeError, OSError, TypeError):
@@ -390,6 +396,7 @@ def save_post_state(state: PostState) -> None:
             "test_session_posted": sorted(state.test_session_posted),
             "scorecard_innings_posted": sorted(state.scorecard_innings_posted),
             "toss_posted_at": state.toss_posted_at,
+            "toss_captain_pending_at": state.toss_captain_pending_at,
             "live_last": state.live_last,
         }
         POST_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1185,6 +1192,38 @@ def _resolve_match_url(match_key: str, match_links: dict[str, str]) -> str:
     return ""
 
 
+async def _enrich_live_player_stats(
+    page: Page,
+    update_info: MatchUpdateInfo,
+    match_key: str,
+    match_links: dict[str, str],
+) -> None:
+    if update_info.batters or update_info.bowlers:
+        return
+    match_url = _resolve_match_url(match_key, match_links)
+    if not match_url:
+        return
+    batters, bowlers = await fetch_live_player_stats(page, match_url)
+    if batters:
+        update_info.batters = batters
+    if bowlers:
+        update_info.bowlers = bowlers
+    if batters or bowlers:
+        logger.info(
+            "Live stats fetched from ESPN: %d batters, %d bowlers for %s",
+            len(batters),
+            len(bowlers),
+            match_key,
+        )
+        if not update_info.batting_team:
+            if update_info.score1 and not update_info.score2:
+                update_info.batting_team = update_info.team1
+                update_info.bowling_team = update_info.team2
+            elif update_info.score2 and not update_info.score1:
+                update_info.batting_team = update_info.team2
+                update_info.bowling_team = update_info.team1
+
+
 def _playing_xi_pending(match_key: str, team1: str, team2: str, state: PostState) -> bool:
     for team in (team1, team2):
         if make_playing_xi_key(match_key, team) not in state.playing_xi_posted:
@@ -1319,21 +1358,71 @@ def _toss_announced(block: str) -> bool:
     return bool(TOSS_PATTERN.search(block))
 
 
+def _captain_toss_pending_remaining(match_key: str, state: PostState) -> float:
+    pending_at = state.toss_captain_pending_at.get(match_key)
+    if not pending_at:
+        return float(CAPTAIN_TOSS_RETRY_SECONDS)
+    try:
+        elapsed = (datetime.now() - datetime.fromisoformat(pending_at)).total_seconds()
+    except ValueError:
+        return 0.0
+    return max(0.0, CAPTAIN_TOSS_RETRY_SECONDS - elapsed)
+
+
+def _captain_toss_should_wait(match_key: str, state: PostState) -> bool:
+    pending_at = state.toss_captain_pending_at.get(match_key)
+    if not pending_at:
+        return True
+    try:
+        elapsed = (datetime.now() - datetime.fromisoformat(pending_at)).total_seconds()
+    except ValueError:
+        return False
+    return elapsed < CAPTAIN_TOSS_RETRY_SECONDS
+
+
+async def _generate_toss_image_or_wait(
+    page: Page,
+    block: str,
+    match_key: str,
+    match_links: dict[str, str],
+    update_info: MatchUpdateInfo,
+    state: PostState,
+) -> Path | None:
+    match_url = _resolve_match_url(match_key, match_links)
+    match_fmt = detect_format(block)
+    captains = await try_build_captain_toss_info(page, match_url, update_info, match_fmt)
+
+    if captain_toss_ready(captains):
+        state.toss_captain_pending_at.pop(match_key, None)
+        save_post_state(state)
+        logger.info("Using captain toss graphic for %s", match_key)
+        return generate_captain_toss_image(update_info, captains)  # type: ignore[arg-type]
+
+    if _captain_toss_should_wait(match_key, state):
+        if match_key not in state.toss_captain_pending_at:
+            state.toss_captain_pending_at[match_key] = datetime.now().isoformat()
+            save_post_state(state)
+        remaining = _captain_toss_pending_remaining(match_key, state)
+        logger.info("Captain toss pending retry (%.0fs left) for %s", remaining, match_key)
+        return None
+
+    state.toss_captain_pending_at.pop(match_key, None)
+    if captains is not None:
+        logger.info("Captain toss fallback to flag graphic for %s", match_key)
+    return generate_match_image(update_info)
+
+
 async def _resolve_toss_image(
     page: Page,
     block: str,
     match_key: str,
     match_links: dict[str, str],
     update_info: MatchUpdateInfo,
-) -> Path:
-    match_url = _resolve_match_url(match_key, match_links)
-    captains = await try_build_captain_toss_info(page, match_url, update_info)
-    if captain_toss_ready(captains):
-        logger.info("Using captain toss graphic for %s", match_key)
-        return generate_captain_toss_image(update_info, captains)  # type: ignore[arg-type]
-    if captains is not None:
-        logger.info("Captain toss fallback to flag graphic for %s", match_key)
-    return generate_match_image(update_info)
+    state: PostState,
+) -> Path | None:
+    return await _generate_toss_image_or_wait(
+        page, block, match_key, match_links, update_info, state
+    )
 
 
 async def _publish_toss_update(
@@ -1349,7 +1438,11 @@ async def _publish_toss_update(
         update_info = parse_match_block(block, "toss")
         if not update_info.match_key:
             update_info.match_key = match_key
-        image_path = await _resolve_toss_image(page, block, match_key, match_links, update_info)
+        image_path = await _resolve_toss_image(
+            page, block, match_key, match_links, update_info, state
+        )
+        if image_path is None:
+            return False
         post_text = build_update_caption(update_info)
     except Exception as exc:
         logger.error("Toss image generation failed for %s: %s", match_key, exc)
@@ -1727,23 +1820,23 @@ def block_match_phase(block: str, state: PostState | None = None) -> str:
         return "result"
     if first_upper.startswith("TODAY,"):
         if test_in_progress:
-            return "live" if SCORE_PATTERN.search(block) else "other"
+            return "live" if block_contains_valid_score(block) else "other"
         return "preview"
     if any(line.upper().startswith("TOMORROW,") for line in lines):
         if test_in_progress:
-            return "live" if SCORE_PATTERN.search(block) else "other"
+            return "live" if block_contains_valid_score(block) else "other"
         return "tomorrow"
 
     match_date = parse_match_date_from_block(block)
     tomorrow = date.today() + timedelta(days=1)
     if match_date == tomorrow:
         if test_in_progress:
-            return "live" if SCORE_PATTERN.search(block) else "other"
+            return "live" if block_contains_valid_score(block) else "other"
         return "tomorrow"
 
     if UPCOMING_PATTERN.search(block) or "match yet to begin" in block.lower():
         if test_in_progress:
-            return "live" if SCORE_PATTERN.search(block) else "other"
+            return "live" if block_contains_valid_score(block) else "other"
         if match_date == date.today():
             return "preview"
         if match_date == tomorrow:
@@ -1751,7 +1844,7 @@ def block_match_phase(block: str, state: PostState | None = None) -> str:
         return "preview"
 
     if first_upper == "LIVE" or (
-        SCORE_PATTERN.search(block)
+        block_contains_valid_score(block)
         and "won by" not in block.lower()
         and not UPCOMING_PATTERN.search(block)
         and "match yet to begin" not in block.lower()
@@ -2238,6 +2331,10 @@ async def run_cycle(
                     xi_attempted=xi_attempted,
                 )
 
+            if phase == "live" and not block_has_valid_live_score(block):
+                logger.info("Live skip: no valid score in block for %s", match_key)
+                continue
+
             if phase != "live" and not should_post_one_shot(block, phase, _post_state):
                 logger.info("Skipping %s (%s) — already posted", match_key, phase)
                 continue
@@ -2267,14 +2364,19 @@ async def run_cycle(
                     update_info = parse_match_block(block, phase)
                     update_info.match_key = match_key
                     if phase == "live":
+                        await _enrich_live_player_stats(
+                            page, update_info, match_key, match_links
+                        )
                         live_signature = make_live_signature(update_info)
                         innings_break = update_info.innings_status == "innings_break"
                         session_break = update_info.session_break
                         test_day = update_info.test_day
                     if phase == "toss":
                         image_path = await _resolve_toss_image(
-                            page, block, match_key, match_links, update_info
+                            page, block, match_key, match_links, update_info, _post_state
                         )
+                        if image_path is None:
+                            continue
                     else:
                         image_path = generate_match_image(update_info)
                     post_text = build_update_caption(update_info)
