@@ -318,13 +318,15 @@ LIVE_PREMIUM_FLAG_Y = 88
 LIVE_PREMIUM_TEAM_Y = 178
 LIVE_PREMIUM_CENTER_SCORE_Y = 210
 LIVE_PREMIUM_CENTER_OVERS_Y = 290
-LIVE_PREMIUM_PILL_Y = 388
-LIVE_PREMIUM_HEADLINE_Y = 456
-LIVE_PREMIUM_PANEL_TOP = 512
+LIVE_PREMIUM_PILL_Y = 372
+LIVE_PREMIUM_HEADLINE_Y = 438
 LIVE_PREMIUM_PANEL_W = 480
-LIVE_PREMIUM_PANEL_H = 200
 LIVE_PREMIUM_PANEL_GAP = 40
-LIVE_PREMIUM_BOTTOM_PAD = 36
+LIVE_PREMIUM_PANEL_INNER_PAD = 16
+LIVE_PREMIUM_PANEL_HEADER_H = 40
+LIVE_PREMIUM_PANEL_LINE_H = 30
+LIVE_PREMIUM_PANEL_GAP_AFTER_PILL = 12
+LIVE_PREMIUM_BOTTOM_PAD = 24
 LIVE_PREMIUM_HEADLINE_LINE_H = 32
 LIVE_PREMIUM_PILL_LINE_H = 44
 
@@ -2165,27 +2167,66 @@ def _draw_live_badge_premium(draw: ImageDraw.ImageDraw, badge_text: str, y: int)
             )
 
 
+def _premium_pill_dimensions(info: MatchUpdateInfo) -> tuple[int, int]:
+    pill_font = _load_font(22, bold=False)
+    display = _update_footer_line(info)[:64]
+    bbox = pill_font.getbbox(display)
+    text_h = bbox[3] - bbox[1]
+    pad_y = 12
+    return LIVE_PREMIUM_PILL_Y, text_h + pad_y * 2
+
+
+def _premium_subline_bottom(info: MatchUpdateInfo, pill_y: int, pill_h: int) -> int:
+    is_chase = info.innings_status in ("chase", "innings_break") and info.score1 and info.score2
+    has_rr = is_chase and (info.current_run_rate or info.required_run_rate)
+    has_headline = bool(info.headline) and not is_chase
+    if has_rr or has_headline:
+        return LIVE_PREMIUM_HEADLINE_Y + LIVE_PREMIUM_HEADLINE_LINE_H
+    return pill_y + pill_h
+
+
+def _premium_panel_top(info: MatchUpdateInfo, pill_y: int, pill_h: int) -> int:
+    return _premium_subline_bottom(info, pill_y, pill_h) + LIVE_PREMIUM_PANEL_GAP_AFTER_PILL
+
+
+def _premium_panel_height(info: MatchUpdateInfo) -> int:
+    batter_lines = len(info.batters[:2]) if info.batters else 0
+    bowler_lines = len(info.bowlers[:2]) if info.bowlers else 0
+    line_count = max(batter_lines, bowler_lines, 1)
+    return LIVE_PREMIUM_PANEL_HEADER_H + line_count * LIVE_PREMIUM_PANEL_LINE_H + LIVE_PREMIUM_PANEL_INNER_PAD
+
+
 def _premium_live_card_height(info: MatchUpdateInfo) -> int:
+    pill_y, pill_h = _premium_pill_dimensions(info)
     if info.batters or info.bowlers:
-        return LIVE_PREMIUM_PANEL_TOP + LIVE_PREMIUM_PANEL_H + LIVE_PREMIUM_BOTTOM_PAD
+        panel_top = _premium_panel_top(info, pill_y, pill_h)
+        return panel_top + _premium_panel_height(info) + LIVE_PREMIUM_BOTTOM_PAD
     is_chase = info.innings_status in ("chase", "innings_break") and info.score1 and info.score2
     has_rr = is_chase and (info.current_run_rate or info.required_run_rate)
     has_headline = bool(info.headline) and not is_chase
     if has_rr or has_headline:
         return LIVE_PREMIUM_HEADLINE_Y + LIVE_PREMIUM_HEADLINE_LINE_H + LIVE_PREMIUM_BOTTOM_PAD
-    return LIVE_PREMIUM_PILL_Y + LIVE_PREMIUM_PILL_LINE_H + LIVE_PREMIUM_BOTTOM_PAD
+    return pill_y + pill_h + LIVE_PREMIUM_BOTTOM_PAD
 
 
-def _draw_premium_stats_panels(base: Image.Image, info: MatchUpdateInfo) -> Image.Image:
+def _draw_premium_stats_panels(
+    base: Image.Image,
+    info: MatchUpdateInfo,
+    pill_y: int,
+    pill_h: int,
+) -> Image.Image:
     if not info.batters and not info.bowlers:
         return base
 
     height = base.height
     overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    panel_top = LIVE_PREMIUM_PANEL_TOP
+    panel_top = _premium_panel_top(info, pill_y, pill_h)
+    panel_h = _premium_panel_height(info)
     left_x = (UPDATE_IMAGE_WIDTH - LIVE_PREMIUM_PANEL_W * 2 - LIVE_PREMIUM_PANEL_GAP) // 2
     right_x = left_x + LIVE_PREMIUM_PANEL_W + LIVE_PREMIUM_PANEL_GAP
+    panel_text_right = right_x + LIVE_PREMIUM_PANEL_W - 20
+    line_start_y = panel_top + LIVE_PREMIUM_PANEL_HEADER_H
 
     batting_team = info.batting_team or info.team1
     bowling_team = info.bowling_team or info.team2
@@ -2195,7 +2236,7 @@ def _draw_premium_stats_panels(base: Image.Image, info: MatchUpdateInfo) -> Imag
 
     if info.batters:
         draw.rounded_rectangle(
-            [(left_x, panel_top), (left_x + LIVE_PREMIUM_PANEL_W, panel_top + LIVE_PREMIUM_PANEL_H)],
+            [(left_x, panel_top), (left_x + LIVE_PREMIUM_PANEL_W, panel_top + panel_h)],
             radius=16,
             fill=LIVE_PREMIUM_PANEL_BAT_BG,
         )
@@ -2207,7 +2248,7 @@ def _draw_premium_stats_panels(base: Image.Image, info: MatchUpdateInfo) -> Imag
         )
         for idx, batter in enumerate(info.batters[:2]):
             draw.text(
-                (left_x + 20, panel_top + 56 + idx * 34),
+                (left_x + 20, line_start_y + idx * LIVE_PREMIUM_PANEL_LINE_H),
                 f"• {batter.lstrip('• ')}",
                 font=line_font,
                 fill=LIVE_PREMIUM_TEXT,
@@ -2215,23 +2256,27 @@ def _draw_premium_stats_panels(base: Image.Image, info: MatchUpdateInfo) -> Imag
 
     if info.bowlers:
         draw.rounded_rectangle(
-            [(right_x, panel_top), (right_x + LIVE_PREMIUM_PANEL_W, panel_top + LIVE_PREMIUM_PANEL_H)],
+            [(right_x, panel_top), (right_x + LIVE_PREMIUM_PANEL_W, panel_top + panel_h)],
             radius=16,
             fill=LIVE_PREMIUM_PANEL_BOWL_BG,
         )
-        draw.text(
-            (right_x + 20, panel_top + 16),
+        _draw_right_text(
+            draw,
             f"{_team_abbrev(bowling_team)} bowling",
-            font=header_font,
-            fill=LIVE_PREMIUM_BOWL_ACCENT,
+            panel_text_right,
+            panel_top + 16,
+            header_font,
+            LIVE_PREMIUM_BOWL_ACCENT,
         )
         for idx, bowler in enumerate(info.bowlers[:2]):
-            line = bowler.rstrip(" •")
-            draw.text(
-                (right_x + 20, panel_top + 56 + idx * 34),
-                f"• {line.lstrip('• ')}",
-                font=line_font,
-                fill=LIVE_PREMIUM_TEXT,
+            line = bowler.strip()
+            _draw_right_text(
+                draw,
+                line,
+                panel_text_right,
+                line_start_y + idx * LIVE_PREMIUM_PANEL_LINE_H,
+                line_font,
+                LIVE_PREMIUM_TEXT,
             )
 
     return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
@@ -2408,12 +2453,10 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
     display = pill_text[:64]
     bbox = draw.textbbox((0, 0), display, font=pill_font)
     text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
     pad_x, pad_y = 28, 12
     pill_w = min(text_w + pad_x * 2, UPDATE_IMAGE_WIDTH - 80)
-    pill_h = text_h + pad_y * 2
     pill_x = (UPDATE_IMAGE_WIDTH - pill_w) // 2
-    pill_y = LIVE_PREMIUM_PILL_Y
+    pill_y, pill_h = _premium_pill_dimensions(info)
     pill_overlay = Image.new("RGBA", (UPDATE_IMAGE_WIDTH, height), (0, 0, 0, 0))
     pill_draw = ImageDraw.Draw(pill_overlay)
     pill_draw.rounded_rectangle(
@@ -2449,7 +2492,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
             LIVE_PREMIUM_MUTED,
         )
 
-    return _draw_premium_stats_panels(img, info)
+    return _draw_premium_stats_panels(img, info, pill_y, pill_h)
 
 
 def _draw_live_player_stats(

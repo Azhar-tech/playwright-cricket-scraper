@@ -1712,6 +1712,10 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
                 and chase_info.score2
             )
         _status("Chase premium PNG (both scores parsed)", chase_ok, f"{img.size} expected {chase_expected}")
+        compact_ok = chase_expected[1] < 650
+        _status("Chase+stats compact height", compact_ok, f"height={chase_expected[1]}")
+        if not compact_ok:
+            img_ok = False
         if not chase_ok:
             img_ok = False
         elif keep_image:
