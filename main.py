@@ -840,6 +840,8 @@ async def _read_playing_xi_page(
     url: str,
     team1: str,
     team2: str,
+    *,
+    min_players: int = 11,
 ) -> dict[str, list[PlayingXiPlayer]]:
     await _dismiss_cookie_banner(page)
     await asyncio.sleep(random.uniform(1.5, 3.0))
@@ -852,7 +854,7 @@ async def _read_playing_xi_page(
         return {}
 
     squads = parse_playing_xi_from_html(html, body_text, team1, team2)
-    return {team: players for team, players in squads.items() if len(players) >= 11}
+    return {team: players for team, players in squads.items() if len(players) >= min_players}
 
 
 async def fetch_playing_xi(
@@ -860,6 +862,8 @@ async def fetch_playing_xi(
     match_url: str,
     team1: str,
     team2: str,
+    *,
+    min_players: int = 11,
 ) -> dict[str, list[PlayingXiPlayer]]:
     if not match_url:
         return {}
@@ -885,7 +889,7 @@ async def fetch_playing_xi(
         else:
             logger.info("Trying partial Playing XI parse after navigation timeout: %s", url)
 
-        complete = await _read_playing_xi_page(page, url, team1, team2)
+        complete = await _read_playing_xi_page(page, url, team1, team2, min_players=min_players)
         if complete:
             logger.info("Fetched Playing XI from %s", url)
             return complete
@@ -1310,13 +1314,17 @@ async def _wait_for_toss_xi_delay(
         await asyncio.sleep(remaining)
 
 
-def _best_block_for_playing_xi(blocks: list[str], state: PostState) -> str | None:
+def _best_block_for_playing_xi(
+    blocks: list[str], state: PostState, *, catchup: bool = False
+) -> str | None:
     for block in blocks:
         if block_match_phase(block, state=state) == "toss":
             return block
     for block in blocks:
         match_key = make_match_key(block)
-        if _toss_announced(block) and not _playing_xi_blocked_by_live(block, state, match_key):
+        if _toss_announced(block) and not _playing_xi_blocked_by_live(
+            block, state, match_key, catchup=catchup
+        ):
             return block
     return None
 
@@ -1618,7 +1626,7 @@ async def post_missed_toss_and_playing_xi(
             continue
 
         toss_block = next((block for block in blocks if _toss_announced(block)), None)
-        xi_block = _best_block_for_playing_xi(blocks, state)
+        xi_block = _best_block_for_playing_xi(blocks, state, catchup=True)
         toss_done = match_key in state.toss_posted
         toss_visible = toss_block is not None
         if xi_block:

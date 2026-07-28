@@ -330,6 +330,74 @@ LIVE_PREMIUM_BOTTOM_PAD = 24
 LIVE_PREMIUM_HEADLINE_LINE_H = 32
 LIVE_PREMIUM_PILL_LINE_H = 44
 
+# Light theme for Test-match cards — same layout as the dark ODI/T20 theme,
+# but with a white background, so every foreground color needs a dark
+# counterpart (white text on white would be invisible).
+LIVE_PREMIUM_TEST_BG_TOP = "#FFFFFF"
+LIVE_PREMIUM_TEST_BG_MID = "#F5F7F8"
+LIVE_PREMIUM_TEST_BG_BOTTOM = "#ECEFF1"
+LIVE_PREMIUM_TEST_PANEL_BAT_BG = (232, 245, 233, 235)
+LIVE_PREMIUM_TEST_PANEL_BOWL_BG = (227, 242, 253, 235)
+LIVE_PREMIUM_TEST_TEXT = "#1A1A1A"
+LIVE_PREMIUM_TEST_MUTED = "#5F6368"
+LIVE_PREMIUM_TEST_SCORE = "#1B5E20"
+LIVE_PREMIUM_TEST_BAT_ACCENT = "#1B5E20"
+LIVE_PREMIUM_TEST_BOWL_ACCENT = "#0D47A1"
+LIVE_PREMIUM_TEST_PILL_OUTLINE = "#D0D3D6"
+
+
+@dataclass
+class LivePremiumPalette:
+    bg_top: str
+    bg_mid: str
+    bg_bottom: str
+    text: str
+    muted: str
+    score: str
+    bat_accent: str
+    bowl_accent: str
+    panel_bat_bg: tuple[int, int, int, int]
+    panel_bowl_bg: tuple[int, int, int, int]
+    use_stadium_art: bool = True
+    pill_outline: str | None = None
+
+
+LIVE_PREMIUM_DARK_PALETTE = LivePremiumPalette(
+    bg_top=LIVE_PREMIUM_BG_TOP,
+    bg_mid=LIVE_PREMIUM_BG_MID,
+    bg_bottom=LIVE_PREMIUM_BG_BOTTOM,
+    text=LIVE_PREMIUM_TEXT,
+    muted=LIVE_PREMIUM_MUTED,
+    score=LIVE_PREMIUM_SCORE,
+    bat_accent=LIVE_PREMIUM_BAT_ACCENT,
+    bowl_accent=LIVE_PREMIUM_BOWL_ACCENT,
+    panel_bat_bg=LIVE_PREMIUM_PANEL_BAT_BG,
+    panel_bowl_bg=LIVE_PREMIUM_PANEL_BOWL_BG,
+    use_stadium_art=True,
+    pill_outline=None,
+)
+
+LIVE_PREMIUM_TEST_PALETTE = LivePremiumPalette(
+    bg_top=LIVE_PREMIUM_TEST_BG_TOP,
+    bg_mid=LIVE_PREMIUM_TEST_BG_MID,
+    bg_bottom=LIVE_PREMIUM_TEST_BG_BOTTOM,
+    text=LIVE_PREMIUM_TEST_TEXT,
+    muted=LIVE_PREMIUM_TEST_MUTED,
+    score=LIVE_PREMIUM_TEST_SCORE,
+    bat_accent=LIVE_PREMIUM_TEST_BAT_ACCENT,
+    bowl_accent=LIVE_PREMIUM_TEST_BOWL_ACCENT,
+    panel_bat_bg=LIVE_PREMIUM_TEST_PANEL_BAT_BG,
+    panel_bowl_bg=LIVE_PREMIUM_TEST_PANEL_BOWL_BG,
+    use_stadium_art=False,
+    pill_outline=LIVE_PREMIUM_TEST_PILL_OUTLINE,
+)
+
+
+def _live_premium_palette(format_tag: str) -> LivePremiumPalette:
+    if format_tag == "Test":
+        return LIVE_PREMIUM_TEST_PALETTE
+    return LIVE_PREMIUM_DARK_PALETTE
+
 # ---------------------------------------------------------------------------
 # Toss card layout constants
 # ---------------------------------------------------------------------------
@@ -598,6 +666,11 @@ def _is_valid_cricket_score(score: str) -> bool:
     cleaned = score.strip()
     if not cleaned:
         return False
+    if "&" in cleaned:
+        # Multi-innings Test score (e.g. "311 & 126/7") — every innings part
+        # must independently look like a valid score.
+        parts = [p.strip() for p in cleaned.split("&")]
+        return bool(parts) and all(p and _is_valid_cricket_score(p) for p in parts)
     if SEASON_SCORE_PATTERN.match(cleaned):
         return False
     match = re.match(r"^(\d+)/(\d+)$", cleaned)
@@ -676,7 +749,10 @@ def _parse_score_line(line: str, *, innings_complete: bool = False) -> tuple[str
     scores = [score for score in SCORE_PATTERN.findall(masked) if _is_valid_cricket_score(score)]
 
     if "&" in line:
-        parts = re.findall(r"\d+(?:/\d+)?", line)
+        # Strip any leading overs annotation (e.g. "(43 ov)") first so it
+        # doesn't get swept up as a bogus extra innings score below.
+        and_masked = SIMPLE_OVERS_PATTERN.sub(" ", masked)
+        parts = re.findall(r"\d+(?:/\d+)?", and_masked)
         if parts:
             return " & ".join(parts[:3]), ""
 
@@ -1215,10 +1291,11 @@ def parse_match_block(block: str, phase: str) -> MatchUpdateInfo:
     )
 
     scores = _scores_by_team_detailed(block)
-    if scores:
-        info.score1, info.overs1 = scores[0][1], scores[0][2]
-        if len(scores) >= 2:
-            info.score2, info.overs2 = scores[1][1], scores[1][2]
+    scores_by_team = {team: (score, overs) for team, score, overs in scores}
+    if info.team1 in scores_by_team:
+        info.score1, info.overs1 = scores_by_team[info.team1]
+    if info.team2 in scores_by_team:
+        info.score2, info.overs2 = scores_by_team[info.team2]
 
     if phase == "result":
         info.headline = _result_line(block)
@@ -2099,15 +2176,17 @@ def _update_footer_line(info: MatchUpdateInfo) -> str:
     return footer[:80]
 
 
-def _draw_live_stadium_background(width: int, height: int) -> Image.Image:
+def _draw_live_stadium_background(
+    width: int, height: int, palette: LivePremiumPalette = LIVE_PREMIUM_DARK_PALETTE
+) -> Image.Image:
     img = _draw_vertical_gradient(
         width,
         height,
-        LIVE_PREMIUM_BG_TOP,
-        LIVE_PREMIUM_BG_MID,
-        LIVE_PREMIUM_BG_BOTTOM,
+        palette.bg_top,
+        palette.bg_mid,
+        palette.bg_bottom,
     )
-    if STADIUM_ASSET.exists():
+    if palette.use_stadium_art and STADIUM_ASSET.exists():
         try:
             with Image.open(STADIUM_ASSET) as stadium:
                 stadium = stadium.convert("RGBA")
@@ -2120,7 +2199,7 @@ def _draw_live_stadium_background(width: int, height: int) -> Image.Image:
                 img.paste(stadium, (0, int(height * 0.12)), stadium)
         except OSError:
             pass
-    else:
+    elif palette.use_stadium_art:
         overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         for cx, cy, rx, ry in (
@@ -2214,6 +2293,7 @@ def _draw_premium_stats_panels(
     info: MatchUpdateInfo,
     pill_y: int,
     pill_h: int,
+    palette: LivePremiumPalette = LIVE_PREMIUM_DARK_PALETTE,
 ) -> Image.Image:
     if not info.batters and not info.bowlers:
         return base
@@ -2238,27 +2318,27 @@ def _draw_premium_stats_panels(
         draw.rounded_rectangle(
             [(left_x, panel_top), (left_x + LIVE_PREMIUM_PANEL_W, panel_top + panel_h)],
             radius=16,
-            fill=LIVE_PREMIUM_PANEL_BAT_BG,
+            fill=palette.panel_bat_bg,
         )
         draw.text(
             (left_x + 20, panel_top + 16),
             f"{_team_abbrev(batting_team)} batting",
             font=header_font,
-            fill=LIVE_PREMIUM_BAT_ACCENT,
+            fill=palette.bat_accent,
         )
         for idx, batter in enumerate(info.batters[:2]):
             draw.text(
                 (left_x + 20, line_start_y + idx * LIVE_PREMIUM_PANEL_LINE_H),
                 f"• {batter.lstrip('• ')}",
                 font=line_font,
-                fill=LIVE_PREMIUM_TEXT,
+                fill=palette.text,
             )
 
     if info.bowlers:
         draw.rounded_rectangle(
             [(right_x, panel_top), (right_x + LIVE_PREMIUM_PANEL_W, panel_top + panel_h)],
             radius=16,
-            fill=LIVE_PREMIUM_PANEL_BOWL_BG,
+            fill=palette.panel_bowl_bg,
         )
         _draw_right_text(
             draw,
@@ -2266,7 +2346,7 @@ def _draw_premium_stats_panels(
             panel_text_right,
             panel_top + 16,
             header_font,
-            LIVE_PREMIUM_BOWL_ACCENT,
+            palette.bowl_accent,
         )
         for idx, bowler in enumerate(info.bowlers[:2]):
             line = bowler.strip()
@@ -2276,7 +2356,7 @@ def _draw_premium_stats_panels(
                 panel_text_right,
                 line_start_y + idx * LIVE_PREMIUM_PANEL_LINE_H,
                 line_font,
-                LIVE_PREMIUM_TEXT,
+                palette.text,
             )
 
     return Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
@@ -2287,8 +2367,9 @@ def _premium_team_label(team: str) -> str:
 
 
 def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
+    palette = _live_premium_palette(info.format_tag)
     height = _premium_live_card_height(info)
-    img = _draw_live_stadium_background(UPDATE_IMAGE_WIDTH, height)
+    img = _draw_live_stadium_background(UPDATE_IMAGE_WIDTH, height, palette)
     draw = ImageDraw.Draw(img)
 
     name_font = _load_font(22, bold=True)
@@ -2309,7 +2390,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
         LIVE_PREMIUM_LEFT_CX,
         LIVE_PREMIUM_TEAM_Y,
         name_font,
-        LIVE_PREMIUM_TEXT,
+        palette.text,
     )
     _draw_centered_text(
         draw,
@@ -2317,7 +2398,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
         LIVE_PREMIUM_RIGHT_CX,
         LIVE_PREMIUM_TEAM_Y,
         name_font,
-        LIVE_PREMIUM_TEXT,
+        palette.text,
     )
 
     is_chase = info.innings_status in ("chase", "innings_break") and info.score1 and info.score2
@@ -2328,7 +2409,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
             info.score1 or "\u2014",
             LIVE_PREMIUM_LEFT_CX,
             LIVE_PREMIUM_CENTER_SCORE_Y - 10,
-            LIVE_PREMIUM_TEXT,
+            palette.text,
             160,
             max_size=40,
         )
@@ -2339,14 +2420,14 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                 LIVE_PREMIUM_LEFT_CX,
                 LIVE_PREMIUM_CENTER_OVERS_Y - 10,
                 side_overs_font,
-                LIVE_PREMIUM_MUTED,
+                palette.muted,
             )
         _draw_score_fitted(
             draw,
             info.score2 or "\u2014",
             LIVE_PREMIUM_RIGHT_CX,
             LIVE_PREMIUM_CENTER_SCORE_Y - 10,
-            LIVE_PREMIUM_SCORE,
+            palette.score,
             160,
             max_size=40,
         )
@@ -2357,7 +2438,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                 LIVE_PREMIUM_RIGHT_CX,
                 LIVE_PREMIUM_CENTER_OVERS_Y - 10,
                 side_overs_font,
-                LIVE_PREMIUM_MUTED,
+                palette.muted,
             )
         if info.headline:
             _draw_centered_text(
@@ -2366,7 +2447,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                 LIVE_PREMIUM_CENTER_CX,
                 LIVE_PREMIUM_CENTER_SCORE_Y + 8,
                 _load_font(24, bold=True),
-                LIVE_PREMIUM_TEXT,
+                palette.text,
             )
     else:
         if batting == info.team1:
@@ -2383,7 +2464,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
             center_score,
             LIVE_PREMIUM_CENTER_CX,
             LIVE_PREMIUM_CENTER_SCORE_Y,
-            LIVE_PREMIUM_SCORE,
+            palette.score,
             220,
             max_size=64,
         )
@@ -2394,7 +2475,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                 LIVE_PREMIUM_CENTER_CX,
                 LIVE_PREMIUM_CENTER_OVERS_Y,
                 side_overs_font,
-                LIVE_PREMIUM_MUTED,
+                palette.muted,
             )
 
         if other_yet:
@@ -2406,7 +2487,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                 other_cx,
                 LIVE_PREMIUM_CENTER_SCORE_Y + 18,
                 status_font,
-                LIVE_PREMIUM_MUTED,
+                palette.muted,
             )
         elif info.score1 and info.score2:
             if batting == info.team1:
@@ -2415,7 +2496,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                     info.score2,
                     LIVE_PREMIUM_RIGHT_CX,
                     LIVE_PREMIUM_CENTER_SCORE_Y - 10,
-                    LIVE_PREMIUM_TEXT,
+                    palette.text,
                     160,
                     max_size=36,
                 )
@@ -2426,7 +2507,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                         LIVE_PREMIUM_RIGHT_CX,
                         LIVE_PREMIUM_CENTER_OVERS_Y - 10,
                         side_overs_font,
-                        LIVE_PREMIUM_MUTED,
+                        palette.muted,
                     )
             else:
                 _draw_score_fitted(
@@ -2434,7 +2515,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                     info.score1,
                     LIVE_PREMIUM_LEFT_CX,
                     LIVE_PREMIUM_CENTER_SCORE_Y - 10,
-                    LIVE_PREMIUM_TEXT,
+                    palette.text,
                     160,
                     max_size=36,
                 )
@@ -2445,7 +2526,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                         LIVE_PREMIUM_LEFT_CX,
                         LIVE_PREMIUM_CENTER_OVERS_Y - 10,
                         side_overs_font,
-                        LIVE_PREMIUM_MUTED,
+                        palette.muted,
                     )
 
     pill_text = _update_footer_line(info)
@@ -2463,6 +2544,8 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
         [(pill_x, pill_y), (pill_x + pill_w, pill_y + pill_h)],
         radius=pill_h // 2,
         fill=(255, 255, 255, 215),
+        outline=palette.pill_outline,
+        width=2 if palette.pill_outline else 0,
     )
     img = Image.alpha_composite(img.convert("RGBA"), pill_overlay).convert("RGB")
     draw = ImageDraw.Draw(img)
@@ -2480,7 +2563,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
             LIVE_PREMIUM_CENTER_CX,
             LIVE_PREMIUM_HEADLINE_Y,
             _load_font(20, bold=False),
-            LIVE_PREMIUM_MUTED,
+            palette.muted,
         )
     elif info.headline and not is_chase:
         _draw_centered_text(
@@ -2489,10 +2572,10 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
             LIVE_PREMIUM_CENTER_CX,
             LIVE_PREMIUM_HEADLINE_Y,
             _load_font(22, bold=False),
-            LIVE_PREMIUM_MUTED,
+            palette.muted,
         )
 
-    return _draw_premium_stats_panels(img, info, pill_y, pill_h)
+    return _draw_premium_stats_panels(img, info, pill_y, pill_h, palette)
 
 
 def _draw_live_player_stats(

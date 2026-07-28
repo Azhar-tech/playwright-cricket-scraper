@@ -297,7 +297,11 @@ async def try_build_captain_toss_info(
     if missing and match_url:
         from main import fetch_playing_xi  # lazy import avoids circular dependency
 
-        squads = await fetch_playing_xi(page, match_url, team1, team2)
+        # Captain lookup only needs one correctly-tagged player, not a full
+        # confirmed XI, so don't drop a team's squad just because a row or two
+        # failed to parse (common mid-innings) — that would silently discard a
+        # perfectly good captain match along with the rest of the squad.
+        squads = await fetch_playing_xi(page, match_url, team1, team2, min_players=1)
         for team in missing:
             name = _resolve_captain_name_from_espn(team, squads)
             if name:

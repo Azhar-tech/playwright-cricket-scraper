@@ -920,7 +920,24 @@ def test_playing_xi_catchup_bypasses_live_guard() -> bool:
     not_abandoned = match_key not in state2.playing_xi_abandoned
     _status("Catch-up bypass does not abandon Playing XI", not_abandoned)
 
-    return blocked_normal and allowed_catchup and not_abandoned
+    state3 = PostState()
+    best_normal = _best_block_for_playing_xi([live_block], state3)
+    _status("Non-catchup best-block still refuses a live-only block", best_normal is None)
+
+    best_catchup = _best_block_for_playing_xi([live_block], state3, catchup=True)
+    _status(
+        "Catch-up best-block picks the live block when toss is announced in it",
+        best_catchup == live_block,
+        best_catchup or "none",
+    )
+
+    return (
+        blocked_normal
+        and allowed_catchup
+        and not_abandoned
+        and best_normal is None
+        and best_catchup == live_block
+    )
 
 
 def test_playing_xi_retry_interval() -> bool:
@@ -1060,6 +1077,50 @@ def test_test_session_posting() -> bool:
             t20_key_ok,
         ]
     )
+
+
+def test_multi_innings_score_attribution() -> bool:
+    print("\n=== 3l2. Multi-innings Test score attribution ===")
+
+    block = """
+1st Test, Tarouba, July 25 - 29, 2026, Pakistan tour of West Indies
+West Indies
+(43 ov) 311 & 126/7
+Pakistan
+282
+Day 3 - West Indies lead by 155 runs
+""".strip()
+
+    info = parse_match_block(block, "live")
+    team1_ok = info.team1 == "West Indies" and info.score1 == "311 & 126/7"
+    _status(
+        "West Indies gets its own multi-innings score, not Pakistan's",
+        team1_ok,
+        f"team1={info.team1} score1={info.score1!r}",
+    )
+    team2_ok = info.team2 == "Pakistan" and info.score2 == "282"
+    _status(
+        "Pakistan keeps its completed-innings score",
+        team2_ok,
+        f"team2={info.team2} score2={info.score2!r}",
+    )
+
+    single_and_block = """
+Day 4 - Sri Lanka tour of West Indies
+Sri Lanka
+22 & 549/9 & 92/2
+West Indies
+499
+""".strip()
+    multi_info = parse_match_block(single_and_block, "live")
+    multi_ok = multi_info.score1 == "22 & 549/9 & 92/2" and multi_info.score2 == "499"
+    _status(
+        "Three-innings score string preserved for the correct team",
+        multi_ok,
+        f"score1={multi_info.score1!r} score2={multi_info.score2!r}",
+    )
+
+    return team1_ok and team2_ok and multi_ok
 
 
 def test_preview_fonts() -> bool:
@@ -1750,12 +1811,14 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
 
     img_ok = True
 
+    odi_bg_pixel = None
     first_info = parse_match_block(SAMPLE_FIRST_INNINGS_ODI.strip(), "live")
     first_expected = (1080, _premium_live_card_height(first_info))
     try:
         first_path = generate_match_image(first_info)
         with Image.open(first_path) as img:
             first_ok = img.size == first_expected and first_path.stat().st_size >= 10_000
+            odi_bg_pixel = img.convert("RGB").getpixel((20, 20))
         _status("First innings premium PNG", first_ok, f"{img.size} expected {first_expected}")
         if not first_ok:
             img_ok = False
@@ -1846,11 +1909,13 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
         headline="Day 4 \u2014 Stumps: SL 22 & 549/9 & 92/2, WI 499",
         match_key="sri-lanka-west-indies|TEST|2nd Test",
     )
+    test_bg_pixel = None
     try:
         stumps_path = generate_match_image(long_score_info)
         stumps_expected = (1080, _premium_live_card_height(long_score_info))
         with Image.open(stumps_path) as img:
             stumps_ok = img.size == stumps_expected and stumps_path.stat().st_size >= 5_000
+            test_bg_pixel = img.convert("RGB").getpixel((20, 20))
         _status("Test stumps premium PNG", stumps_ok, f"{img.size} expected {stumps_expected}")
         if not stumps_ok:
             img_ok = False
@@ -1859,6 +1924,22 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
     except Exception as exc:
         _status("Test stumps premium PNG", False, str(exc))
         img_ok = False
+
+    if odi_bg_pixel is not None and test_bg_pixel is not None:
+        odi_dark_ok = max(odi_bg_pixel) < 60
+        test_light_ok = min(test_bg_pixel) > 230
+        _status(
+            "ODI card keeps the dark green-navy background",
+            odi_dark_ok,
+            f"pixel={odi_bg_pixel}",
+        )
+        _status(
+            "Test card uses the new white background",
+            test_light_ok,
+            f"pixel={test_bg_pixel}",
+        )
+        if not (odi_dark_ok and test_light_ok):
+            img_ok = False
 
     return img_ok
 
@@ -2550,6 +2631,7 @@ async def run(args: argparse.Namespace) -> int:
     playing_xi_catchup_ok = test_playing_xi_catchup_bypasses_live_guard()
     playing_xi_retry_ok = test_playing_xi_retry_interval()
     test_session_ok = test_test_session_posting()
+    multi_innings_score_ok = test_multi_innings_score_attribution()
     scorecard_ok = test_scorecard_parsing(keep_image=args.match_image)
     scorecard_trigger_ok = test_scorecard_trigger_window()
     ban_zim_sc_ok = test_ban_zim_chase_scorecard()
@@ -2595,6 +2677,7 @@ async def run(args: argparse.Namespace) -> int:
         and playing_xi_catchup_ok
         and playing_xi_retry_ok
         and test_session_ok
+        and multi_innings_score_ok
         and scorecard_ok
         and scorecard_trigger_ok
         and ban_zim_sc_ok
