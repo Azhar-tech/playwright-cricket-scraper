@@ -23,6 +23,7 @@ from playwright_stealth import Stealth
 
 from match_image import (
     _abbrev_dismissal,
+    _color_luminance,
     _extract_time,
     _extract_venue_from_line,
     _is_score_line,
@@ -45,6 +46,8 @@ from match_image import (
     parse_preview_block,
     scorecard_parse_valid,
     is_excluded_fixture,
+    ScorecardBatter,
+    ScorecardInfo,
 )
 from playing_xi import (
     build_playing_xi_caption,
@@ -1944,6 +1947,120 @@ def test_premium_live_card(keep_image: bool = False) -> bool:
     return img_ok
 
 
+def test_test_stumps_lead_and_layout(keep_image: bool = False) -> bool:
+    print("\n=== 3i0b. Test stumps card: badge width, lead line, batting attribution ===")
+    from PIL import Image, ImageDraw
+
+    from match_image import (
+        _draw_live_badge_premium,
+        _load_font,
+        _premium_live_card_height,
+        _test_lead_text,
+        LIVE_PREMIUM_BADGE_RED,
+        LIVE_PREMIUM_CENTER_SCORE_Y,
+        LIVE_PREMIUM_PILL_Y,
+        LIVE_PREMIUM_TEST_LEAD_Y,
+        LIVE_PREMIUM_TEST_RECAP_Y,
+        _hex_rgb,
+    )
+
+    all_ok = True
+
+    def _sl(label: str, cond: bool, detail: str = "") -> None:
+        nonlocal all_ok
+        _status(label, cond, detail)
+        if not cond:
+            all_ok = False
+
+    # --- Badge pill is wider than the old cramped 18px padding ---
+    badge_text = "DAY 3 \u2014 STUMPS"
+    probe = Image.new("RGB", (1080, 100), (255, 255, 255))
+    draw = ImageDraw.Draw(probe)
+    _draw_live_badge_premium(draw, badge_text, 10)
+    row_y = 25
+    red = _hex_rgb(LIVE_PREMIUM_BADGE_RED)
+    xs = [x for x in range(1080) if probe.getpixel((x, row_y)) == red]
+    pill_w = (max(xs) - min(xs) + 1) if xs else 0
+    font = _load_font(20, bold=True)
+    text_bbox = draw.textbbox((0, 0), badge_text, font=font)
+    text_w = text_bbox[2] - text_bbox[0]
+    pad_each_side = (pill_w - text_w) / 2 if pill_w else 0
+    _sl(
+        "Badge pill has generous padding around the text",
+        pad_each_side >= 24,
+        f"pill_w={pill_w} text_w={text_w} pad_each_side={pad_each_side:.1f}",
+    )
+
+    # --- WI (2nd innings, 311 & 126/7) vs PAK (282, all out) stumps block ---
+    block = """
+LIVE
+Pakistan tour of West Indies 2026
+1st Test, Tarouba, July 25 - 29, 2026
+West Indies
+311 & 126/7
+Pakistan
+282
+Stumps - Day 3
+""".strip()
+    info = parse_match_block(block, "live")
+
+    _sl(
+        "West Indies (still batting) is attributed as the batting team",
+        info.batting_team == "West Indies" and info.bowling_team == "Pakistan",
+        f"batting_team={info.batting_team} bowling_team={info.bowling_team}",
+    )
+
+    lead_text = _test_lead_text(info)
+    _sl(
+        "Lead line combines 1st-innings lead (29) with 2nd-innings runs (126)",
+        lead_text == "West Indies lead by 155 runs",
+        repr(lead_text),
+    )
+
+    expected_height = _premium_live_card_height(info)
+    try:
+        path = generate_match_image(info)
+        with Image.open(path) as img:
+            size_ok = img.size == (1080, expected_height) and path.stat().st_size >= 5_000
+            rgb = img.convert("RGB")
+            bg = rgb.getpixel((5, img.height - 5))
+
+            def _row_has_content(y: int, x_range: range, band: int = 12) -> bool:
+                for yy in range(y, min(y + band, img.height)):
+                    for x in x_range:
+                        px = rgb.getpixel((x, yy))
+                        if sum(abs(a - b) for a, b in zip(px, bg)) > 40:
+                            return True
+                return False
+
+            no_overlap_ok = not _row_has_content(
+                LIVE_PREMIUM_CENTER_SCORE_Y + 8, range(430, 650)
+            )
+            recap_drawn_ok = _row_has_content(LIVE_PREMIUM_TEST_RECAP_Y, range(300, 780))
+            lead_drawn_ok = _row_has_content(LIVE_PREMIUM_TEST_LEAD_Y, range(300, 780))
+        _sl("Stumps card height unchanged (dynamic formula)", size_ok, f"{img.size} expected (1080, {expected_height})")
+        _sl(
+            "No stray content in the old overlap zone (between the two scores)",
+            no_overlap_ok,
+            "",
+        )
+        _sl("Recap line rendered below the scores", recap_drawn_ok, "")
+        _sl("Lead line rendered above the pill", lead_drawn_ok, "")
+        _sl(
+            "Recap/lead lines stay above the white pill",
+            LIVE_PREMIUM_TEST_LEAD_Y + 24 < LIVE_PREMIUM_PILL_Y,
+            f"lead_y={LIVE_PREMIUM_TEST_LEAD_Y} pill_y={LIVE_PREMIUM_PILL_Y}",
+        )
+        if keep_image:
+            print(f"       Saved stumps lead layout at: {path}")
+        else:
+            path.unlink(missing_ok=True)
+    except Exception as exc:
+        _sl("Stumps card generation", False, str(exc))
+
+    return all_ok
+
+
 def test_innings_layouts(keep_image: bool = False) -> bool:
     print("\n=== 3i. Innings-aware live layouts ===")
     from PIL import Image
@@ -2302,6 +2419,80 @@ def test_scorecard_parsing(keep_image: bool = False) -> bool:
     return all_ok
 
 
+def test_scorecard_contrast() -> bool:
+    print("\n=== 4d2. Scorecard Gradient Contrast (Pakistan white kit) ===")
+    all_ok = True
+
+    def _con(label: str, cond: bool, detail: str = "") -> None:
+        nonlocal all_ok
+        _status(label, cond, detail)
+        if not cond:
+            all_ok = False
+
+    batters = [
+        ScorecardBatter("Shamas Ilyas", "c Sanjeewani b Vimukthi", 9, 7, 0, 0),
+        ScorecardBatter("Feroza Nazir", "lbw b Athapaththu", 40, 35, 0, 0),
+        ScorecardBatter("Aiman Fatima", "run out", 0, 3, 0, 0),
+        ScorecardBatter("Sidra Zafar", "lbw b Vimukthi", 0, 1, 0, 0),
+        ScorecardBatter("Aliya Riaz", "c Perera b Ranaweera", 34, 71, 0, 0),
+        ScorecardBatter("Natalia Pervaiz", "c & b Athapaththu", 39, 39, 0, 0),
+        ScorecardBatter("Sana Mir", "c Sewwandi b Dilhari", 41, 49, 0, 0),
+        ScorecardBatter("Umm-e-Hani", "c Perera b Athapaththu", 1, 9, 0, 0),
+        ScorecardBatter("Nashra Sandhu", "b Dilhari", 5, 9, 0, 0),
+        ScorecardBatter("Rubab Khan", "", 1, 1, 0, 0, True),
+    ]
+    info = ScorecardInfo(
+        team1="Pakistan Women",
+        team2="Sri Lanka Women",
+        batting_team="Pakistan Women",
+        score="187",
+        overs="",
+        match_label="3rd ODI",
+        series="Pakistan Women tour of Sri Lanka",
+        format_tag="ODI",
+        batters=batters,
+        squad_names=[b.name for b in batters],
+        extras="",
+        extras_runs=18,
+        total_runs=187,
+    )
+
+    try:
+        img_path = generate_scorecard_image(info)
+        from PIL import Image
+
+        with Image.open(img_path) as img:
+            rgb = img.convert("RGB")
+            h = img.height
+            samples = [
+                (frac, rgb.getpixel((20, int(h * frac))))
+                for frac in (0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95)
+            ]
+        img_path.unlink(missing_ok=True)
+
+        max_luminance = 130.0
+        worst = max(
+            (0.299 * px[0] + 0.587 * px[1] + 0.114 * px[2], frac, px) for frac, px in samples
+        )
+        _con(
+            "No light band anywhere down the gradient (Pakistan's white kit color)",
+            worst[0] <= max_luminance,
+            f"worst luminance={worst[0]:.0f} at {worst[1]*100:.0f}% pixel={worst[2]}",
+        )
+
+        top_px = samples[0][1]
+        top_luminance = 0.299 * top_px[0] + 0.587 * top_px[1] + 0.114 * top_px[2]
+        _con(
+            "Card still starts recognizably dark-green (branding not stripped)",
+            top_px[1] > top_px[0] and top_px[1] > top_px[2] and top_luminance < 100,
+            f"top pixel={top_px}",
+        )
+    except Exception as exc:
+        _con("Scorecard contrast image generated", False, str(exc))
+
+    return all_ok
+
+
 def test_scorecard_trigger_window() -> bool:
     print("\n=== 4e. Innings Scorecard Trigger Window ===")
     all_ok = True
@@ -2620,6 +2811,7 @@ async def run(args: argparse.Namespace) -> int:
     toss_retry_ok = test_toss_retry_window()
     live_stats_ok = test_live_player_stats()
     premium_live_ok = test_premium_live_card(keep_image=args.match_image)
+    stumps_lead_ok = test_test_stumps_lead_and_layout(keep_image=args.match_image)
     live_flow_ok = test_live_posting_flow()
     score_parse_ok = test_odi_overs_score_parsing()
     season_score_ok = test_season_score_rejection()
@@ -2633,6 +2825,7 @@ async def run(args: argparse.Namespace) -> int:
     test_session_ok = test_test_session_posting()
     multi_innings_score_ok = test_multi_innings_score_attribution()
     scorecard_ok = test_scorecard_parsing(keep_image=args.match_image)
+    scorecard_contrast_ok = test_scorecard_contrast()
     scorecard_trigger_ok = test_scorecard_trigger_window()
     ban_zim_sc_ok = test_ban_zim_chase_scorecard()
     scorecard_cooldown_ok = test_scorecard_catchup_on_live_cooldown()
@@ -2666,6 +2859,7 @@ async def run(args: argparse.Namespace) -> int:
         and toss_retry_ok
         and live_stats_ok
         and premium_live_ok
+        and stumps_lead_ok
         and live_flow_ok
         and score_parse_ok
         and season_score_ok
@@ -2679,6 +2873,7 @@ async def run(args: argparse.Namespace) -> int:
         and test_session_ok
         and multi_innings_score_ok
         and scorecard_ok
+        and scorecard_contrast_ok
         and scorecard_trigger_ok
         and ban_zim_sc_ok
         and scorecard_cooldown_ok

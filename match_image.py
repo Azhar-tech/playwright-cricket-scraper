@@ -318,6 +318,8 @@ LIVE_PREMIUM_FLAG_Y = 88
 LIVE_PREMIUM_TEAM_Y = 178
 LIVE_PREMIUM_CENTER_SCORE_Y = 210
 LIVE_PREMIUM_CENTER_OVERS_Y = 290
+LIVE_PREMIUM_TEST_RECAP_Y = 302
+LIVE_PREMIUM_TEST_LEAD_Y = 334
 LIVE_PREMIUM_PILL_Y = 372
 LIVE_PREMIUM_HEADLINE_Y = 438
 LIVE_PREMIUM_PANEL_W = 480
@@ -640,6 +642,21 @@ def _color_luminance(hex_color: str) -> float:
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
+def _clamp_light_color(hex_color: str, max_luminance: float = 130.0) -> str:
+    """Darken a color toward the scorecard's navy base if it's too light to
+    keep the card's fixed light text (SC_PREMIUM_TEXT/MUTED/NOT_OUT) legible
+    on top of it (e.g. a team's white/pale kit color used as a gradient stop)."""
+    if _color_luminance(hex_color) <= max_luminance:
+        return hex_color
+    dark_rgb = _hex_rgb(SC_PREMIUM_DARK)
+    rgb = _hex_rgb(hex_color)
+    for step in range(1, 11):
+        blended = _interpolate_color(rgb, dark_rgb, step / 10)
+        if 0.299 * blended[0] + 0.587 * blended[1] + 0.114 * blended[2] <= max_luminance:
+            return "#{:02x}{:02x}{:02x}".format(*blended)
+    return SC_PREMIUM_DARK
+
+
 def _toss_wash_color(team: str) -> str:
     """Pick a visible wash color; fall back to secondary when primary is too light."""
     primary, secondary = _team_kit_colors(team)
@@ -785,6 +802,20 @@ def _runs_from_score(score: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _innings_total_runs(score: str) -> int | None:
+    """Sum runs across every "&"-separated innings segment.
+
+    e.g. "311 & 126/7" -> 437, "282" -> 282, "22 & 549/9 & 92/2" -> 663.
+    """
+    totals: list[int] = []
+    for part in score.split("&"):
+        match = re.match(r"\s*(\d+)", part.strip())
+        if not match:
+            return None
+        totals.append(int(match.group(1)))
+    return sum(totals) if totals else None
+
+
 def _parse_chase_meta(block: str) -> tuple[int | None, int | None, int | None, str]:
     target: int | None = None
     runs_needed: int | None = None
@@ -828,7 +859,13 @@ def _parse_run_rates(block: str) -> tuple[str, str]:
 
 def _innings_complete(score: str, overs: str, fmt: str) -> bool:
     wickets_match = re.search(r"/(\d+)", score)
-    if wickets_match and int(wickets_match.group(1)) >= 10:
+    if wickets_match:
+        if int(wickets_match.group(1)) >= 10:
+            return True
+    elif score.strip():
+        # A score with no "/wickets" suffix at all (e.g. "282") means the
+        # innings is finished (all out or declared) — a still-batting side
+        # is always reported with a "/N" suffix, even at 0 down.
         return True
     if not overs:
         return False
@@ -977,6 +1014,29 @@ def _chasing_team_from_scores(info: MatchUpdateInfo, fmt: str) -> str | None:
     if t2_done and not t1_done:
         return info.team1
     return None
+
+
+def _test_lead_text(info: MatchUpdateInfo) -> str:
+    """Build a "<team> lead by N runs" sentence for a Test with both teams' totals.
+
+    Skipped for genuine last-innings chases (info.target already set — the
+    headline already reads "X need N runs to win" there, so a lead statement
+    would be redundant/confusing).
+    """
+    if info.format_tag != "Test" or info.target is not None:
+        return ""
+    if not info.score1 or not info.score2:
+        return ""
+    total1 = _innings_total_runs(info.score1)
+    total2 = _innings_total_runs(info.score2)
+    if total1 is None or total2 is None:
+        return ""
+    diff = total1 - total2
+    if diff == 0:
+        return "Scores level"
+    leader = info.team1 if diff > 0 else info.team2
+    runs = abs(diff)
+    return f"{leader} lead by {runs} run{'s' if runs != 1 else ''}"
 
 
 def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
@@ -2220,7 +2280,7 @@ def _draw_live_badge_premium(draw: ImageDraw.ImageDraw, badge_text: str, y: int)
     bbox = draw.textbbox((0, 0), badge_text, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
-    pad_x, pad_y = 18, 8
+    pad_x, pad_y = 28, 8
     pill_w = text_w + pad_x * 2
     pill_h = text_h + pad_y * 2
     cx = UPDATE_IMAGE_WIDTH // 2
@@ -2440,7 +2500,33 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                 side_overs_font,
                 palette.muted,
             )
-        if info.headline:
+        if info.format_tag == "Test":
+            # The Test recap ("Day 3 - Stumps: WI 311 & 126/7, PAK 282") and
+            # lead line are long enough to collide with the two side scores
+            # if drawn inline, so they go in the gap below the scores instead
+            # (overs1/overs2 are always empty for Test multi-innings scores,
+            # so this space is otherwise unused) — this keeps the card height
+            # unchanged since both lines stay above LIVE_PREMIUM_PILL_Y.
+            if info.headline:
+                _draw_centered_text(
+                    draw,
+                    info.headline[:72],
+                    LIVE_PREMIUM_CENTER_CX,
+                    LIVE_PREMIUM_TEST_RECAP_Y,
+                    _load_font(20, bold=False),
+                    palette.muted,
+                )
+            lead_text = _test_lead_text(info)
+            if lead_text:
+                _draw_centered_text(
+                    draw,
+                    lead_text,
+                    LIVE_PREMIUM_CENTER_CX,
+                    LIVE_PREMIUM_TEST_LEAD_Y,
+                    _load_font(22, bold=True),
+                    palette.score,
+                )
+        elif info.headline:
             _draw_centered_text(
                 draw,
                 info.headline[:72],
@@ -3619,8 +3705,10 @@ def _draw_scorecard_card(info: ScorecardInfo) -> Image.Image:
     img_h = footer_y + SC_PREMIUM_FOOTER_H + SC_PREMIUM_BOTTOM_PAD
 
     primary, secondary = _team_kit_colors(info.batting_team)
+    top = _clamp_light_color(primary)
+    mid = _clamp_light_color(secondary)
     img = _draw_vertical_gradient(
-        UPDATE_IMAGE_WIDTH, img_h, primary, secondary, SC_PREMIUM_DARK
+        UPDATE_IMAGE_WIDTH, img_h, top, mid, SC_PREMIUM_DARK
     )
     draw = ImageDraw.Draw(img)
 
