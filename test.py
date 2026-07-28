@@ -856,6 +856,73 @@ def test_playing_xi_live_guard() -> bool:
     )
 
 
+def test_team_extraction_ignores_trailing_junk() -> bool:
+    print("\n=== 3k1b. Team extraction ignores trailing junk ===")
+    from main import _resolve_match_url, _teams_from_block
+
+    clean_block = (
+        "LIVE\n"
+        "3rd ODI, Hambantota, July 28, 2026, Pakistan Women tour of Sri Lanka\n"
+        "Pakistan Women\n"
+        "10/1 (2.3 ov)\n"
+        "Sri Lanka Women\n"
+        "282\n"
+    )
+    # Simulate a sibling match card getting glued onto the same block by an
+    # imperfect split — extra tracked-team-looking lines after the real 2.
+    corrupted_block = clean_block + "Pakistan\nWest Indies\n120/3 (15.0 ov)\n"
+
+    teams_clean = _teams_from_block(clean_block)
+    teams_corrupted = _teams_from_block(corrupted_block)
+    _status(
+        "Clean block yields exactly 2 teams",
+        teams_clean == ["pakistan women", "sri lanka women"],
+        str(teams_clean),
+    )
+    _status(
+        "Corrupted block still yields only the real 2 teams",
+        teams_corrupted == teams_clean,
+        str(teams_corrupted),
+    )
+
+    key_clean = make_match_key(clean_block)
+    key_corrupted = make_match_key(corrupted_block)
+    keys_match = key_clean == key_corrupted
+    _status("Match key identical for clean vs junk-appended block", keys_match, f"{key_clean} == {key_corrupted}")
+
+    team1, team2 = _teams_from_block_names(corrupted_block)
+    names_ok = {team1, team2} == {"Pakistan Women", "Sri Lanka Women"}
+    _status("_teams_from_block_names ignores trailing junk teams", names_ok, f"{team1}, {team2}")
+
+    match_links = {key_clean: "https://www.espncricinfo.com/series/x/match/y"}
+    url = _resolve_match_url(key_corrupted, match_links)
+    url_ok = url == match_links[key_clean]
+    _status("_resolve_match_url resolves via clean team-set match", url_ok, url)
+
+    return teams_clean == ["pakistan women", "sri lanka women"] and teams_corrupted == teams_clean and keys_match and names_ok and url_ok
+
+
+def test_playing_xi_catchup_bypasses_live_guard() -> bool:
+    print("\n=== 3k1c. Playing XI catch-up bypasses live guard ===")
+    live_block = SAMPLE_LIVE_WITH_TOSS_BLOCK.strip()
+    match_key = make_match_key(live_block)
+
+    state = PostState()
+    state.toss_posted.add(match_key)
+    blocked_normal = not _playing_xi_allowed(match_key, live_block, state)
+    _status("Normal flow still blocked once match is live", blocked_normal)
+
+    state2 = PostState()
+    state2.toss_posted.add(match_key)
+    allowed_catchup = _playing_xi_allowed(match_key, live_block, state2, catchup=True)
+    _status("Catch-up flow bypasses the live-match guard", allowed_catchup)
+
+    not_abandoned = match_key not in state2.playing_xi_abandoned
+    _status("Catch-up bypass does not abandon Playing XI", not_abandoned)
+
+    return blocked_normal and allowed_catchup and not_abandoned
+
+
 def test_playing_xi_retry_interval() -> bool:
     print("\n=== 3k3. Playing XI retry interval ===")
     from datetime import datetime
@@ -2479,6 +2546,8 @@ async def run(args: argparse.Namespace) -> int:
     playing_xi_ok = test_playing_xi(keep_image=args.playing_xi_image)
     playing_xi_trigger_ok = test_playing_xi_triggers()
     playing_xi_guard_ok = test_playing_xi_live_guard()
+    team_extraction_ok = test_team_extraction_ignores_trailing_junk()
+    playing_xi_catchup_ok = test_playing_xi_catchup_bypasses_live_guard()
     playing_xi_retry_ok = test_playing_xi_retry_interval()
     test_session_ok = test_test_session_posting()
     scorecard_ok = test_scorecard_parsing(keep_image=args.match_image)
@@ -2522,6 +2591,8 @@ async def run(args: argparse.Namespace) -> int:
         and playing_xi_ok
         and playing_xi_trigger_ok
         and playing_xi_guard_ok
+        and team_extraction_ok
+        and playing_xi_catchup_ok
         and playing_xi_retry_ok
         and test_session_ok
         and scorecard_ok

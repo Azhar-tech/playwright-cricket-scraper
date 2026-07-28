@@ -180,9 +180,10 @@ FORMAT_INTERVALS = {"T20": 1800, "ODI": 3600, "TEST": 1800}
 POST_INTERVAL = 1800  # 30 minutes between scrape cycles
 INTER_MATCH_POST_DELAY = 60  # 1 minute between posts in the same cycle
 PLAYING_XI_AFTER_TOSS_DELAY = 150  # seconds after toss before first XI post
+PLAYING_XI_CATCHUP_SETTLE_DELAY = 10  # short settle wait when catching up a late toss+XI
 PLAYING_XI_TEAM_DELAY = 60  # seconds between team 1 and team 2 XI posts
 PLAYING_XI_PENDING_INTERVAL = max(180, PLAYING_XI_AFTER_TOSS_DELAY + 60)
-CAPTAIN_TOSS_RETRY_SECONDS = 600  # wait up to 10 minutes for captain graphic before flag fallback
+CAPTAIN_TOSS_RETRY_SECONDS = 4000  # ~67 min: span at least 2 poll cycles before flag fallback
 FACEBOOK_BG_CHAR_LIMIT = 130
 
 FACEBOOK_BG_PRESETS = [
@@ -1239,10 +1240,16 @@ def _match_underway(block: str, state: PostState) -> bool:
     return phase in ("live", "result")
 
 
-def _playing_xi_blocked_by_live(block: str, state: PostState, match_key: str) -> bool:
+def _playing_xi_blocked_by_live(
+    block: str, state: PostState, match_key: str, *, catchup: bool = False
+) -> bool:
     phase = block_match_phase(block, state=state)
     if phase in ("live", "result"):
-        return True
+        # In a catch-up flow we already know the match is live/finished — that's
+        # exactly why we're catching up on the toss + XI post right now, so this
+        # guard (meant to stop *late* XI attempts in the normal flow) shouldn't
+        # block it here.
+        return not catchup
     if match_key not in state.live_last:
         return False
     if match_key not in state.toss_posted:
@@ -1258,14 +1265,16 @@ def _abandon_playing_xi(match_key: str, state: PostState) -> None:
     logger.info("Playing XI abandoned for %s — match already underway", match_key)
 
 
-def _playing_xi_allowed(match_key: str, block: str, state: PostState) -> bool:
+def _playing_xi_allowed(
+    match_key: str, block: str, state: PostState, *, catchup: bool = False
+) -> bool:
     if match_key in state.playing_xi_abandoned:
         logger.info("Playing XI skipped for %s — abandoned", match_key)
         return False
     if match_key not in state.toss_posted:
         logger.info("Playing XI skipped for %s — toss not posted yet", match_key)
         return False
-    if _playing_xi_blocked_by_live(block, state, match_key):
+    if _playing_xi_blocked_by_live(block, state, match_key, catchup=catchup):
         if match_key in state.live_last and match_key not in state.toss_posted:
             _abandon_playing_xi(match_key, state)
         logger.info("Playing XI skipped for %s — match underway", match_key)
@@ -1286,7 +1295,15 @@ def _toss_xi_delay_remaining(match_key: str, state: PostState) -> float:
         return 0.0
 
 
-async def _wait_for_toss_xi_delay(match_key: str, state: PostState) -> None:
+async def _wait_for_toss_xi_delay(
+    match_key: str, state: PostState, *, catchup: bool = False
+) -> None:
+    if catchup:
+        # Toss was already posted late (match is live); don't wait the full
+        # post-toss delay — just give the ESPN page a moment to settle.
+        logger.info("Catch-up Playing XI — short settle wait (%ds)", PLAYING_XI_CATCHUP_SETTLE_DELAY)
+        await asyncio.sleep(PLAYING_XI_CATCHUP_SETTLE_DELAY)
+        return
     remaining = _toss_xi_delay_remaining(match_key, state)
     if remaining > 0:
         logger.info("Waiting %.0fs after toss before Playing XI", remaining)
@@ -1348,6 +1365,7 @@ async def _ensure_toss_and_xi_before_live(
             page,
             config,
             state,
+            catchup=True,
             posted_count=posted_count,
         )
         xi_attempted.add(match_key)
@@ -1492,6 +1510,7 @@ async def post_playing_xi_if_ready(
     state: PostState,
     *,
     posted_count: int = 0,
+    catchup: bool = False,
 ) -> int:
     match_key = make_match_key(block)
     if match_key not in state.toss_posted:
@@ -1501,9 +1520,9 @@ async def post_playing_xi_if_ready(
         logger.info("Playing XI skipped for %s — abandoned", match_key)
         return posted_count
 
-    await _wait_for_toss_xi_delay(match_key, state)
+    await _wait_for_toss_xi_delay(match_key, state, catchup=catchup)
 
-    if not _playing_xi_allowed(match_key, block, state):
+    if not _playing_xi_allowed(match_key, block, state, catchup=catchup):
         return posted_count
 
     try:
@@ -1661,6 +1680,7 @@ async def post_missed_toss_and_playing_xi(
             config,
             state,
             posted_count=posted_count,
+            catchup=True,
         )
         attempted.add(match_key)
 
@@ -1668,9 +1688,19 @@ async def post_missed_toss_and_playing_xi(
 
 
 def _teams_from_block_names(block: str) -> tuple[str, str]:
-    teams = sorted(
-        {_normalize_team_name(line) for line in block.splitlines() if _line_is_tracked_team(line)}
-    )
+    """First 2 distinct tracked-team display names, in order of appearance.
+
+    Capped at 2 for the same reason as `_teams_from_block` — avoids picking up
+    stray tracked-team text later in the block as a 3rd/4th "team".
+    """
+    teams: list[str] = []
+    for line in block.splitlines():
+        if _line_is_tracked_team(line):
+            normalized = _normalize_team_name(line)
+            if normalized not in teams:
+                teams.append(normalized)
+            if len(teams) >= 2:
+                break
     if len(teams) < 2:
         return "TBD", "TBD"
     return teams[0], teams[1]
@@ -1944,7 +1974,21 @@ def _match_label_from_block(block: str) -> str:
 
 
 def _teams_from_block(block: str) -> list[str]:
-    return sorted({line.lower() for line in block.splitlines() if _line_is_tracked_team(line)})
+    """First 2 distinct tracked-team lines, in order of appearance.
+
+    Capped at 2 so stray tracked-team-looking text later in the block (e.g. a
+    sibling match card glued on by an imperfect split) can't poison the match
+    identity key with extra teams.
+    """
+    teams: list[str] = []
+    for line in block.splitlines():
+        if _line_is_tracked_team(line):
+            normalized = line.strip().lower()
+            if normalized not in teams:
+                teams.append(normalized)
+            if len(teams) >= 2:
+                break
+    return teams
 
 
 def make_match_key(block: str) -> str:
