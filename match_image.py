@@ -766,12 +766,15 @@ def _parse_score_line(line: str, *, innings_complete: bool = False) -> tuple[str
     scores = [score for score in SCORE_PATTERN.findall(masked) if _is_valid_cricket_score(score)]
 
     if "&" in line:
-        # Strip any leading overs annotation (e.g. "(43 ov)") first so it
-        # doesn't get swept up as a bogus extra innings score below.
+        # Strip any leading overs annotation (e.g. "(43 ov)") and any chase
+        # target annotation (e.g. "(T:211)") first so neither gets swept up
+        # as a bogus extra innings score below — a Test team can never bat
+        # more than twice, so at most 2 parts are ever kept.
         and_masked = SIMPLE_OVERS_PATTERN.sub(" ", masked)
+        and_masked = TARGET_PATTERN.sub(" ", and_masked)
         parts = re.findall(r"\d+(?:/\d+)?", and_masked)
         if parts:
-            return " & ".join(parts[:3]), ""
+            return " & ".join(parts[:2]), ""
 
     score = scores[0] if scores else ""
     if not score and re.fullmatch(r"\d+", line):
@@ -1037,6 +1040,40 @@ def _test_lead_text(info: MatchUpdateInfo) -> str:
     leader = info.team1 if diff > 0 else info.team2
     runs = abs(diff)
     return f"{leader} lead by {runs} run{'s' if runs != 1 else ''}"
+
+
+def _test_chase_progress_text(info: MatchUpdateInfo) -> str:
+    """Build a "<abbrev> need N runs to win" sentence for an active Test chase.
+
+    Only meaningful once info.target is set (a genuine last-innings chase —
+    see _test_lead_text, which is skipped in that case so this fills the same
+    slot instead). The batting team's *current* innings runs are read from the
+    first "&"-separated segment of their score line: the source reports the
+    live in-progress innings first, with the completed earlier innings
+    trailing after the "&" (confirmed from the WI vs PAK Day 4 Tea bug, where
+    "39 (T:211) & 282" is current=39, target=211, completed 1st innings=282).
+    """
+    if info.format_tag != "Test" or info.target is None:
+        return ""
+    if info.batting_team == info.team1:
+        batting_score = info.score1
+    elif info.batting_team == info.team2:
+        batting_score = info.score2
+    else:
+        return ""
+    if not batting_score:
+        return ""
+    current_segment = batting_score.split("&")[0].strip()
+    current_runs = _runs_from_score(current_segment)
+    if current_runs is None and re.fullmatch(r"\d+", current_segment):
+        current_runs = int(current_segment)
+    if current_runs is None:
+        return ""
+    remaining = info.target - current_runs
+    if remaining <= 0:
+        return ""
+    abbrev = _team_abbrev(info.batting_team)
+    return f"{abbrev} need {remaining} runs to win"
 
 
 def _populate_live_context(info: MatchUpdateInfo, block: str) -> None:
@@ -2516,7 +2553,7 @@ def _draw_premium_live_card(info: MatchUpdateInfo) -> Image.Image:
                     _load_font(20, bold=False),
                     palette.muted,
                 )
-            lead_text = _test_lead_text(info)
+            lead_text = _test_lead_text(info) or _test_chase_progress_text(info)
             if lead_text:
                 _draw_centered_text(
                     draw,

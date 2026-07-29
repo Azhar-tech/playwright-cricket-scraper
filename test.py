@@ -1108,6 +1108,9 @@ Day 3 - West Indies lead by 155 runs
         f"team2={info.team2} score2={info.score2!r}",
     )
 
+    # A Test team can never really bat 3 times — a 3rd numeric group on an
+    # "&"-joined score line is always noise (e.g. a leaked target/rate figure)
+    # and must be capped away, not preserved.
     single_and_block = """
 Day 4 - Sri Lanka tour of West Indies
 Sri Lanka
@@ -1116,9 +1119,9 @@ West Indies
 499
 """.strip()
     multi_info = parse_match_block(single_and_block, "live")
-    multi_ok = multi_info.score1 == "22 & 549/9 & 92/2" and multi_info.score2 == "499"
+    multi_ok = multi_info.score1 == "22 & 549/9" and multi_info.score2 == "499"
     _status(
-        "Three-innings score string preserved for the correct team",
+        "Bogus 3rd innings group capped away (only 2 real innings kept)",
         multi_ok,
         f"score1={multi_info.score1!r} score2={multi_info.score2!r}",
     )
@@ -2061,6 +2064,109 @@ Stumps - Day 3
     return all_ok
 
 
+def test_test_chase_target_leak_fix(keep_image: bool = False) -> bool:
+    print("\n=== 3i0c. Test chase target-leak fix (WI vs PAK Day 4 Tea) ===")
+    from PIL import Image
+
+    from match_image import (
+        _parse_score_line,
+        _premium_live_card_height,
+        _test_chase_progress_text,
+        _test_lead_text,
+        LIVE_PREMIUM_PILL_Y,
+        LIVE_PREMIUM_TEST_LEAD_Y,
+        LIVE_PREMIUM_TEST_RECAP_Y,
+    )
+
+    all_ok = True
+
+    def _sl(label: str, cond: bool, detail: str = "") -> None:
+        nonlocal all_ok
+        _status(label, cond, detail)
+        if not cond:
+            all_ok = False
+
+    # --- The exact raw line that produced "39 & 211 & 282" in production ---
+    score, overs = _parse_score_line("39 (T:211) & 282")
+    _sl(
+        "Target annotation no longer leaks in as a bogus 3rd innings",
+        score == "39 & 282" and overs == "",
+        f"score={score!r} overs={overs!r}",
+    )
+
+    # --- Full WI vs PAK Day 4 Tea block (Pakistan chasing 211, on 39) ---
+    block = """
+LIVE
+Pakistan tour of West Indies 2026
+1st Test, Tarouba, July 25 - 29, 2026
+West Indies
+311 & 181
+Pakistan
+39 (T:211) & 282
+Tea - Day 4
+""".strip()
+    info = parse_match_block(block, "live")
+
+    _sl(
+        "Pakistan's score line has exactly 2 innings, not 3",
+        info.score2 == "39 & 282",
+        f"score2={info.score2!r}",
+    )
+    _sl(
+        "Pakistan (chasing) is attributed as the batting team",
+        info.batting_team == "Pakistan" and info.bowling_team == "West Indies",
+        f"batting_team={info.batting_team} bowling_team={info.bowling_team}",
+    )
+    _sl("Target parsed correctly", info.target == 211, f"target={info.target}")
+
+    # A lead statement would be misleading during a genuine chase; the
+    # progress-to-target line should be shown in that slot instead.
+    lead_text = _test_lead_text(info)
+    _sl("Lead line suppressed during an active chase", lead_text == "", repr(lead_text))
+
+    progress_text = _test_chase_progress_text(info)
+    _sl(
+        "Chase progress line shows runs still needed (211 - 39 = 172)",
+        progress_text == "PAK need 172 runs to win",
+        repr(progress_text),
+    )
+
+    expected_height = _premium_live_card_height(info)
+    try:
+        path = generate_match_image(info)
+        with Image.open(path) as img:
+            size_ok = img.size == (1080, expected_height) and path.stat().st_size >= 5_000
+            rgb = img.convert("RGB")
+            bg = rgb.getpixel((5, img.height - 5))
+
+            def _row_has_content(y: int, x_range: range, band: int = 12) -> bool:
+                for yy in range(y, min(y + band, img.height)):
+                    for x in x_range:
+                        px = rgb.getpixel((x, yy))
+                        if sum(abs(a - b) for a, b in zip(px, bg)) > 40:
+                            return True
+                return False
+
+            recap_drawn_ok = _row_has_content(LIVE_PREMIUM_TEST_RECAP_Y, range(300, 780))
+            progress_drawn_ok = _row_has_content(LIVE_PREMIUM_TEST_LEAD_Y, range(300, 780))
+        _sl("Chase card height unchanged (dynamic formula)", size_ok, f"{img.size} expected (1080, {expected_height})")
+        _sl("Recap line rendered below the scores", recap_drawn_ok, "")
+        _sl("Chase progress line rendered in place of the lead line", progress_drawn_ok, "")
+        _sl(
+            "Recap/progress lines stay above the white pill",
+            LIVE_PREMIUM_TEST_LEAD_Y + 24 < LIVE_PREMIUM_PILL_Y,
+            f"lead_y={LIVE_PREMIUM_TEST_LEAD_Y} pill_y={LIVE_PREMIUM_PILL_Y}",
+        )
+        if keep_image:
+            print(f"       Saved chase progress layout at: {path}")
+        else:
+            path.unlink(missing_ok=True)
+    except Exception as exc:
+        _sl("Chase card generation", False, str(exc))
+
+    return all_ok
+
+
 def test_innings_layouts(keep_image: bool = False) -> bool:
     print("\n=== 3i. Innings-aware live layouts ===")
     from PIL import Image
@@ -2812,6 +2918,7 @@ async def run(args: argparse.Namespace) -> int:
     live_stats_ok = test_live_player_stats()
     premium_live_ok = test_premium_live_card(keep_image=args.match_image)
     stumps_lead_ok = test_test_stumps_lead_and_layout(keep_image=args.match_image)
+    chase_target_leak_ok = test_test_chase_target_leak_fix(keep_image=args.match_image)
     live_flow_ok = test_live_posting_flow()
     score_parse_ok = test_odi_overs_score_parsing()
     season_score_ok = test_season_score_rejection()
@@ -2860,6 +2967,7 @@ async def run(args: argparse.Namespace) -> int:
         and live_stats_ok
         and premium_live_ok
         and stumps_lead_ok
+        and chase_target_leak_ok
         and live_flow_ok
         and score_parse_ok
         and season_score_ok
