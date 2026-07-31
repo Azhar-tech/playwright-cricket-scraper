@@ -345,13 +345,17 @@ def _player_from_json_obj(obj: dict, index: int) -> PlayingXiPlayer | None:
         obj.get("name")
         or obj.get("fullName")
         or obj.get("longName")
+        or nested.get("longName")
         or nested.get("name")
         or nested.get("fullName")
-        or nested.get("longName")
     )
     if not name or not isinstance(name, str):
         return None
 
+    # ESPN's modern match-players schema tags role via a short code
+    # ("C" / "WK" / "CWK" / "P") on the wrapper object rather than any
+    # boolean flag or descriptive string field.
+    role_type = str(obj.get("playerRoleType") or nested.get("playerRoleType") or "").upper()
     is_captain = bool(
         obj.get("isCaptain")
         or obj.get("is_captain")
@@ -359,6 +363,7 @@ def _player_from_json_obj(obj: dict, index: int) -> PlayingXiPlayer | None:
         or nested.get("isCaptain")
         or nested.get("is_captain")
         or nested.get("captain")
+        or role_type in ("C", "CWK")
     )
     is_keeper = bool(
         obj.get("isKeeper")
@@ -367,6 +372,7 @@ def _player_from_json_obj(obj: dict, index: int) -> PlayingXiPlayer | None:
         or nested.get("isKeeper")
         or nested.get("is_keeper")
         or nested.get("keeper")
+        or role_type in ("WK", "CWK")
     )
 
     roles = ""
@@ -418,7 +424,10 @@ def _squads_from_player_groups(groups: list) -> dict[str, list[PlayingXiPlayer]]
             continue
         team_raw = group.get("team")
         if isinstance(team_raw, dict):
-            team_name = team_raw.get("name")
+            # Prefer the full team name ("Pakistan Women") over ESPN's short
+            # display name ("PAK Women") — only the former matches the
+            # team1/team2 strings the rest of the pipeline tracks matches by.
+            team_name = team_raw.get("longName") or team_raw.get("name")
         else:
             team_name = group.get("teamName") or group.get("name") or team_raw
         players_raw = (

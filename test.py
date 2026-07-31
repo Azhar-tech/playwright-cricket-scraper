@@ -59,6 +59,7 @@ from playing_xi import (
     make_playing_xi_key,
     match_playing_xi_urls,
     parse_playing_xi_from_match_text,
+    parse_playing_xi_from_next_data,
     parse_playing_xi_table_rows,
     enrich_captain_roles_from_text,
     _match_label_from_block,
@@ -1381,6 +1382,111 @@ def test_nz_wi_captain_parse() -> bool:
     _status("JSON squads enriched with captain roles", enrich_ok)
 
     return wi_ok and nz_ok and hope_ok and santner_ok and enrich_ok
+
+
+SAMPLE_ESPN_NEXT_DATA_PAK_W_SL_W = """
+<script id="__NEXT_DATA__" type="application/json">{"props": {"appPageProps": {"data": {"content": {"matchPlayers": {"teamPlayers": [
+  {"team": {"name": "PAK Women", "longName": "Pakistan Women", "abbreviation": "PAK-W"},
+   "players": [
+     {"playerRoleType": "CWK", "player": {"name": "M Ali", "longName": "Muneeba Ali"}},
+     {"playerRoleType": "P", "player": {"name": "S Zulfiqar", "longName": "Sidra Ameen"}},
+     {"playerRoleType": "P", "player": {"name": "A Zafar", "longName": "Ayesha Zafar"}},
+     {"playerRoleType": "P", "player": {"name": "N Chaudhry", "longName": "Natalia Pervaiz"}},
+     {"playerRoleType": "P", "player": {"name": "E Fatima", "longName": "Eyman Fatima"}},
+     {"playerRoleType": "P", "player": {"name": "S Jabeen", "longName": "Fatima Sana"}},
+     {"playerRoleType": "P", "player": {"name": "U Hani", "longName": "Umm-e-Hani"}},
+     {"playerRoleType": "P", "player": {"name": "W Akhtar", "longName": "Waheeda Akhtar"}},
+     {"playerRoleType": "P", "player": {"name": "N Sandhu", "longName": "Nashra Sandhu"}},
+     {"playerRoleType": "P", "player": {"name": "H Bilal", "longName": "Humna Bilal"}},
+     {"playerRoleType": "P", "player": {"name": "M Riasat", "longName": "Momina Riasat"}}
+   ]},
+  {"team": {"name": "SL Women", "longName": "Sri Lanka Women", "abbreviation": "SL-W"},
+   "players": [
+     {"playerRoleType": "C", "player": {"name": "AMCJK Athapaththu", "longName": "Chamari Athapaththu"}},
+     {"playerRoleType": "WK", "player": {"name": "GWHM Perera", "longName": "Anushka Sanjeewani"}},
+     {"playerRoleType": "P", "player": {"name": "I Ranaweera", "longName": "Imesha Dulani"}},
+     {"playerRoleType": "P", "player": {"name": "R Gunaratne", "longName": "Vishmi Gunaratne"}},
+     {"playerRoleType": "P", "player": {"name": "H Samarawickrama", "longName": "Harshitha Samarawickrama"}},
+     {"playerRoleType": "P", "player": {"name": "K Dilhari", "longName": "Kavisha Dilhari"}},
+     {"playerRoleType": "P", "player": {"name": "N Silva", "longName": "Nilakshika Silva"}},
+     {"playerRoleType": "P", "player": {"name": "R Sewwandi", "longName": "Rashmika Sewwandi"}},
+     {"playerRoleType": "P", "player": {"name": "K Kavindi", "longName": "Kawya Kavindi"}},
+     {"playerRoleType": "P", "player": {"name": "B Kumari", "longName": "Sugandika Kumari"}},
+     {"playerRoleType": "P", "player": {"name": "C Praboda", "longName": "Chamudi Praboda"}}
+   ]}
+]}}}}}}</script>
+"""
+
+
+async def test_espn_next_data_playing_xi_schema() -> bool:
+    print("\n=== 3g3d. ESPN __NEXT_DATA__ Playing XI schema (longName + playerRoleType) ===")
+    from unittest.mock import AsyncMock, patch
+
+    from captain_toss import try_build_captain_toss_info
+
+    html = SAMPLE_ESPN_NEXT_DATA_PAK_W_SL_W.strip()
+    squads = parse_playing_xi_from_next_data(html)
+
+    pak_ok = len(squads.get("Pakistan Women", [])) == 11
+    sl_ok = len(squads.get("Sri Lanka Women", [])) == 11
+    _status("Pakistan Women squad keyed by longName (11 players)", pak_ok)
+    _status("Sri Lanka Women squad keyed by longName (11 players)", sl_ok)
+
+    pak_captain = find_team_captain(squads.get("Pakistan Women", []))
+    sl_captain = find_team_captain(squads.get("Sri Lanka Women", []))
+    pak_cap_ok = (
+        pak_captain is not None
+        and "MUNEEBA ALI" in pak_captain.name
+        and pak_captain.roles == "C+WK"
+    )
+    sl_cap_ok = (
+        sl_captain is not None
+        and "CHAMARI ATHAPATHTHU" in sl_captain.name
+        and sl_captain.roles == "C"
+    )
+    _status(
+        "Muneeba Ali tagged C+WK via playerRoleType=CWK",
+        pak_cap_ok,
+        pak_captain.name if pak_captain else "",
+    )
+    _status(
+        "Chamari Athapaththu tagged C via playerRoleType=C",
+        sl_cap_ok,
+        sl_captain.name if sl_captain else "",
+    )
+
+    async def _run_end_to_end() -> bool:
+        toss_block = """
+Sri Lanka Women tour of Pakistan 2026
+1st T20I
+Pakistan Women
+Sri Lanka Women
+Pakistan Women won the toss and elected to bat
+Match starts 2:00 PM
+""".strip()
+        info = parse_match_block(toss_block, "toss")
+        with patch("captain_toss.lookup_captain_name_via_google", new_callable=AsyncMock) as google:
+            with patch("captain_toss.fetch_captain_headshot", new_callable=AsyncMock) as headshot:
+                with patch("main.fetch_playing_xi", new_callable=AsyncMock) as xi:
+                    google.return_value = None
+                    headshot.return_value = None
+                    xi.return_value = squads
+                    result = await try_build_captain_toss_info(
+                        None, "https://www.espncricinfo.com/series/x/match/y/full-scorecard", info, "T20"
+                    )
+        return (
+            result is not None
+            and "MUNEEBA ALI" in result.team1_captain.name.upper()
+            and "CHAMARI ATHAPATHTHU" in result.team2_captain.name.upper()
+        )
+
+    end_to_end_ok = await _run_end_to_end()
+    _status(
+        "try_build_captain_toss_info succeeds via ESPN XI alone (Google fully blocked)",
+        end_to_end_ok,
+    )
+
+    return all([pak_ok, sl_ok, pak_cap_ok, sl_cap_ok, end_to_end_ok])
 
 
 def test_toss_before_live_order() -> bool:
@@ -3039,6 +3145,7 @@ async def run(args: argparse.Namespace) -> int:
     toss_colors_ok = test_toss_card_colors()
     captain_squads_ok = test_captain_from_squads()
     nz_wi_captain_ok = test_nz_wi_captain_parse()
+    espn_next_data_xi_schema_ok = await test_espn_next_data_playing_xi_schema()
     toss_before_live_ok = test_toss_before_live_order()
     captain_toss_ok = test_captain_toss_image(keep_image=args.match_image)
     toss_fallback_ok = test_toss_fallback()
@@ -3089,6 +3196,7 @@ async def run(args: argparse.Namespace) -> int:
         and toss_colors_ok
         and captain_squads_ok
         and nz_wi_captain_ok
+        and espn_next_data_xi_schema_ok
         and toss_before_live_ok
         and captain_toss_ok
         and toss_fallback_ok
