@@ -1517,6 +1517,135 @@ def test_google_captain_lookup() -> bool:
     return all([ok_query, ok_women, ok_extract, ok_norm, mock_ok])
 
 
+class _FakePage:
+    """Minimal Playwright Page stand-in for captain_toss's async helpers."""
+
+    def __init__(self, url: str = "https://www.google.com/search", eval_result=None):
+        self.url = url
+        self._eval_result = eval_result
+
+    async def goto(self, *_args, **_kwargs) -> None:
+        return None
+
+    async def evaluate(self, *_args, **_kwargs):
+        return self._eval_result
+
+
+async def test_captain_toss_image_fallback_and_live_skip() -> bool:
+    print("\n=== 3g9. Captain toss: name-less image fallback + already-live skip-wait ===")
+    from unittest.mock import AsyncMock, patch
+
+    from captain_toss import (
+        CAPTAIN_CACHE_DIR,
+        _search_google_images,
+        fetch_captain_headshot_by_team_query,
+        try_build_captain_toss_info,
+    )
+    from main import PostState, _generate_toss_image_or_wait, make_match_key
+
+    all_ok = True
+
+    def _sl(label: str, cond: bool, detail: str = "") -> None:
+        nonlocal all_ok
+        _status(label, cond, detail)
+        if not cond:
+            all_ok = False
+
+    # --- _search_google_images surfaces both the image URL and alt text ---
+    fake_page = _FakePage(
+        eval_result={"src": "https://example.com/muneeba.jpg", "alt": "Muneeba Ali captain"}
+    )
+    search_result = await _search_google_images(fake_page, "Pakistan Women T20I cricket team captain")
+    _sl(
+        "_search_google_images returns (url, alt)",
+        search_result == ("https://example.com/muneeba.jpg", "Muneeba Ali captain"),
+        repr(search_result),
+    )
+
+    # --- CAPTCHA (google.com/sorry) still short-circuits cleanly ---
+    captcha_page = _FakePage(url="https://www.google.com/sorry/index?continue=...")
+    captcha_result = await _search_google_images(captcha_page, "irrelevant query")
+    _sl("CAPTCHA page yields no result", captcha_result is None, repr(captcha_result))
+
+    # --- fetch_captain_headshot_by_team_query recovers an image + name without any prior name ---
+    team_query_cache = CAPTAIN_CACHE_DIR / "testland-women-t20.jpg"
+    team_query_cache.unlink(missing_ok=True)
+    with patch("captain_toss._download_image", return_value=True):
+        image_path, alt_name = await fetch_captain_headshot_by_team_query(
+            fake_page, "Testland Women", "T20"
+        )
+    _sl(
+        "Team-query fallback returns a cache path and extracted name",
+        image_path == team_query_cache and alt_name == "Muneeba Ali",
+        f"image_path={image_path} alt_name={alt_name!r}",
+    )
+
+    # --- End-to-end: Google name search + ESPN both fail for one team, image fallback saves it ---
+    info = parse_match_block(SAMPLE_TOSS_BLOCK.strip(), "toss")
+    buttler_path = _ensure_fixture_headshot("Jos Buttler", (30, 80, 160))
+    fallback_path = _ensure_fixture_headshot("india-t20i-fallback", (90, 90, 90))
+    with patch("captain_toss.lookup_captain_name_via_google", new_callable=AsyncMock) as google:
+        with patch("captain_toss.fetch_captain_headshot", new_callable=AsyncMock) as headshot:
+            with patch("main.fetch_playing_xi", new_callable=AsyncMock) as xi:
+                with patch(
+                    "captain_toss.fetch_captain_headshot_by_team_query", new_callable=AsyncMock
+                ) as team_query:
+                    google.side_effect = (
+                        lambda page, team, fmt: "Jos Buttler" if team == "England" else None
+                    )
+                    headshot.side_effect = (
+                        lambda page, name, team: buttler_path if "Buttler" in name else None
+                    )
+                    xi.return_value = {}
+                    team_query.side_effect = (
+                        lambda page, team, fmt: (fallback_path, "")
+                        if team == "India"
+                        else (None, "")
+                    )
+                    result = await try_build_captain_toss_info(None, None, info, "T20")
+
+    end_to_end_ok = (
+        result is not None
+        and result.team1_captain.name == "Jos Buttler"
+        and result.team1_captain.image_path == buttler_path
+        and result.team2_captain.name == "IND Captain"
+        and result.team2_captain.image_path == fallback_path
+    )
+    _sl(
+        "try_build falls back to team-query image + generic name for India",
+        end_to_end_ok,
+        f"team1={result.team1_captain if result else None} team2={result.team2_captain if result else None}",
+    )
+
+    # --- already_live=True skips the pending-retry wait entirely ---
+    async def _run_already_live() -> tuple[bool, bool]:
+        state = PostState()
+        block = SAMPLE_TOSS_BLOCK.strip()
+        mk = make_match_key(block)
+        toss_info = parse_match_block(block, "toss")
+        with patch("main.try_build_captain_toss_info", new_callable=AsyncMock) as build:
+            build.return_value = None
+            live_path = await _generate_toss_image_or_wait(
+                None, block, mk, {}, toss_info, state, already_live=True
+            )
+            not_live_path = await _generate_toss_image_or_wait(
+                None, block, mk, {}, toss_info, PostState(), already_live=False
+            )
+        return live_path is not None, not_live_path is None
+
+    live_returns_image, normal_still_waits = await _run_already_live()
+    _sl(
+        "already_live=True returns a fallback image immediately (no pending wait)",
+        live_returns_image,
+    )
+    _sl(
+        "already_live=False (default) still waits for retry as before",
+        normal_still_waits,
+    )
+
+    return all_ok
+
+
 def test_toss_retry_window() -> bool:
     print("\n=== 3g7. Captain toss retry window ===")
     from datetime import datetime, timedelta
@@ -2914,6 +3043,7 @@ async def run(args: argparse.Namespace) -> int:
     captain_toss_ok = test_captain_toss_image(keep_image=args.match_image)
     toss_fallback_ok = test_toss_fallback()
     google_captain_ok = test_google_captain_lookup()
+    captain_image_fallback_ok = await test_captain_toss_image_fallback_and_live_skip()
     toss_retry_ok = test_toss_retry_window()
     live_stats_ok = test_live_player_stats()
     premium_live_ok = test_premium_live_card(keep_image=args.match_image)
@@ -2963,6 +3093,7 @@ async def run(args: argparse.Namespace) -> int:
         and captain_toss_ok
         and toss_fallback_ok
         and google_captain_ok
+        and captain_image_fallback_ok
         and toss_retry_ok
         and live_stats_ok
         and premium_live_ok

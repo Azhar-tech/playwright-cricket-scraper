@@ -1365,6 +1365,7 @@ async def _ensure_toss_and_xi_before_live(
         state,
         page=page,
         match_links=match_links,
+        already_live=True,
     ):
         posted_count += 1
         posted_count = await post_playing_xi_if_ready(
@@ -1413,6 +1414,8 @@ async def _generate_toss_image_or_wait(
     match_links: dict[str, str],
     update_info: MatchUpdateInfo,
     state: PostState,
+    *,
+    already_live: bool = False,
 ) -> Path | None:
     match_url = _resolve_match_url(match_key, match_links)
     match_fmt = detect_format(block)
@@ -1424,7 +1427,10 @@ async def _generate_toss_image_or_wait(
         logger.info("Using captain toss graphic for %s", match_key)
         return generate_captain_toss_image(update_info, captains)  # type: ignore[arg-type]
 
-    if _captain_toss_should_wait(match_key, state):
+    # Once the match is already live and the toss was missed, there's nothing
+    # left to gain by waiting out the retry window — the ideal posting moment
+    # has already passed, so fall back to a graphic immediately instead.
+    if not already_live and _captain_toss_should_wait(match_key, state):
         if match_key not in state.toss_captain_pending_at:
             state.toss_captain_pending_at[match_key] = datetime.now().isoformat()
             save_post_state(state)
@@ -1435,6 +1441,10 @@ async def _generate_toss_image_or_wait(
     state.toss_captain_pending_at.pop(match_key, None)
     if captains is not None:
         logger.info("Captain toss fallback to flag graphic for %s", match_key)
+    elif already_live:
+        logger.info(
+            "Captain toss fallback to flag graphic for %s (match already live)", match_key
+        )
     return generate_match_image(update_info)
 
 
@@ -1445,9 +1455,11 @@ async def _resolve_toss_image(
     match_links: dict[str, str],
     update_info: MatchUpdateInfo,
     state: PostState,
+    *,
+    already_live: bool = False,
 ) -> Path | None:
     return await _generate_toss_image_or_wait(
-        page, block, match_key, match_links, update_info, state
+        page, block, match_key, match_links, update_info, state, already_live=already_live
     )
 
 
@@ -1459,13 +1471,14 @@ async def _publish_toss_update(
     *,
     page: Page,
     match_links: dict[str, str],
+    already_live: bool = False,
 ) -> bool:
     try:
         update_info = parse_match_block(block, "toss")
         if not update_info.match_key:
             update_info.match_key = match_key
         image_path = await _resolve_toss_image(
-            page, block, match_key, match_links, update_info, state
+            page, block, match_key, match_links, update_info, state, already_live=already_live
         )
         if image_path is None:
             return False
@@ -1650,6 +1663,7 @@ async def post_missed_toss_and_playing_xi(
                 state,
                 page=page,
                 match_links=match_links,
+                already_live=True,
             ):
                 posted_count += 1
                 toss_done = True

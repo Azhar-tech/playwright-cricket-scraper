@@ -10,7 +10,7 @@ from urllib.parse import quote_plus
 import requests
 from playwright.async_api import Page
 
-from match_image import CaptainInfo, CaptainTossInfo, MatchUpdateInfo
+from match_image import CaptainInfo, CaptainTossInfo, MatchUpdateInfo, _team_abbrev
 from playing_xi import (
     PlayingXiPlayer,
     captain_display_name,
@@ -188,6 +188,50 @@ async def lookup_captain_name_via_google(page: Page, team: str, fmt: str) -> str
     return name
 
 
+_IMAGE_RESULT_JS = """
+() => {
+  const skip = (src) =>
+    !src ||
+    src.startsWith('data:') ||
+    src.includes('gstatic.com/images/branding') ||
+    src.includes('googlelogo');
+  const imgs = Array.from(document.querySelectorAll('img'));
+  for (const img of imgs) {
+    const src = img.currentSrc || img.src || '';
+    if (skip(src)) continue;
+    if (img.naturalWidth >= 80 && img.naturalHeight >= 80) {
+      return {src, alt: img.alt || ''};
+    }
+  }
+  for (const img of imgs) {
+    const src = img.currentSrc || img.src || '';
+    if (!skip(src)) return {src, alt: img.alt || ''};
+  }
+  return null;
+}
+"""
+
+
+async def _search_google_images(page: Page, query: str) -> tuple[str, str] | None:
+    """Run a Google Images search and return (image_url, alt_text) for the first hit."""
+    search_url = f"https://www.google.com/search?q={quote_plus(query)}&tbm=isch"
+
+    try:
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception as exc:
+        logger.warning("Google Images navigation failed for query %r: %s", query, exc)
+        return None
+
+    if "google.com/sorry" in page.url:
+        logger.warning("Google CAPTCHA during image search for query %r", query)
+        return None
+
+    result = await page.evaluate(_IMAGE_RESULT_JS)
+    if not result or not isinstance(result, dict) or not result.get("src"):
+        return None
+    return result["src"], result.get("alt") or ""
+
+
 async def fetch_captain_headshot(page: Page, name: str, team: str) -> Path | None:
     """Fetch a captain headshot via Google Images; cache locally by player name."""
     cache_path = _cached_headshot_path(name)
@@ -195,51 +239,45 @@ async def fetch_captain_headshot(page: Page, name: str, team: str) -> Path | Non
         logger.info("Using cached captain headshot for %s", name)
         return cache_path
 
-    query = quote_plus(f"{name} {team} cricket player")
-    search_url = f"https://www.google.com/search?q={query}&tbm=isch"
-
-    try:
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-    except Exception as exc:
-        logger.warning("Google Images navigation failed for %s: %s", name, exc)
-        return None
-
-    if "google.com/sorry" in page.url:
-        logger.warning("Google CAPTCHA during captain image search for %s", name)
-        return None
-
-    image_url = await page.evaluate(
-        """
-        () => {
-          const skip = (src) =>
-            !src ||
-            src.startsWith('data:') ||
-            src.includes('gstatic.com/images/branding') ||
-            src.includes('googlelogo');
-          const imgs = Array.from(document.querySelectorAll('img'));
-          for (const img of imgs) {
-            const src = img.currentSrc || img.src || '';
-            if (skip(src)) continue;
-            if (img.naturalWidth >= 80 && img.naturalHeight >= 80) return src;
-          }
-          for (const img of imgs) {
-            const src = img.currentSrc || img.src || '';
-            if (!skip(src)) return src;
-          }
-          return '';
-        }
-        """
-    )
-
-    if not image_url or not isinstance(image_url, str):
+    found = await _search_google_images(page, f"{name} {team} cricket player")
+    if not found:
         logger.info("No Google Images result for %s", name)
         return None
 
+    image_url, _alt = found
     if _download_image(image_url, cache_path):
         logger.info("Cached captain headshot for %s", name)
         return cache_path
 
     return None
+
+
+async def fetch_captain_headshot_by_team_query(
+    page: Page, team: str, fmt: str
+) -> tuple[Path | None, str]:
+    """Best-effort captain photo when the name lookup fails entirely.
+
+    Searches Google Images directly for the team (no player name required),
+    and tries to recover a plausible name from the chosen image's alt text so
+    the toss card isn't stuck with just a generic caption.
+    """
+    cache_path = CAPTAIN_CACHE_DIR / f"{_team_format_slug(team, fmt)}.jpg"
+    if cache_path.exists() and cache_path.stat().st_size >= 1024:
+        logger.info("Using cached team-query captain headshot for %s", team)
+        return cache_path, ""
+
+    found = await _search_google_images(page, _format_captain_query(team, fmt))
+    if not found:
+        logger.info("No Google Images (team-query fallback) result for %s", team)
+        return None, ""
+
+    image_url, alt_text = found
+    if not _download_image(image_url, cache_path):
+        return None, ""
+
+    alt_name = _extract_captain_name_from_text(alt_text, team)
+    logger.info("Cached team-query captain headshot for %s (alt name=%r)", team, alt_name)
+    return cache_path, alt_name
 
 
 def _resolve_captain_name_from_espn(
@@ -261,12 +299,16 @@ async def _build_captain_toss_info(
     page: Page,
     update_info: MatchUpdateInfo,
     captain_names: dict[str, str],
+    captain_images: dict[str, Path] | None = None,
 ) -> CaptainTossInfo:
+    captain_images = captain_images or {}
     team1, team2 = update_info.team1, update_info.team2
     captains: dict[str, CaptainInfo] = {}
     for team in (team1, team2):
         display_name = captain_names[team]
-        image_path = await fetch_captain_headshot(page, display_name, team)
+        image_path = captain_images.get(team)
+        if image_path is None:
+            image_path = await fetch_captain_headshot(page, display_name, team)
         captains[team] = CaptainInfo(team=team, name=display_name, image_path=image_path)
     return CaptainTossInfo(
         team1_captain=captains[team1],
@@ -280,13 +322,15 @@ async def try_build_captain_toss_info(
     update_info: MatchUpdateInfo,
     fmt: str,
 ) -> CaptainTossInfo | None:
-    """Build captain toss metadata: Google captain names first, ESPN XI fallback."""
+    """Build captain toss metadata: Google captain names first, ESPN XI fallback,
+    then a name-less Google Images search as a last resort for a photo."""
     team1, team2 = update_info.team1, update_info.team2
     if not team1 or not team2:
         return None
 
     squads: dict[str, list[PlayingXiPlayer]] = {}
     captain_names: dict[str, str] = {}
+    captain_images: dict[str, Path] = {}
 
     for team in (team1, team2):
         name = await lookup_captain_name_via_google(page, team, fmt)
@@ -307,9 +351,23 @@ async def try_build_captain_toss_info(
             if name:
                 captain_names[team] = name
 
+    # Last resort: neither Google's text search nor ESPN's XI page gave us a
+    # name (e.g. a Google CAPTCHA blocked the text search). Rather than give
+    # up on the team entirely, search Google Images directly for the team
+    # (no name needed) so the card can still show a real photo.
+    still_missing = [team for team in (team1, team2) if team not in captain_names]
+    for team in still_missing:
+        image_path, alt_name = await fetch_captain_headshot_by_team_query(page, team, fmt)
+        if image_path is not None:
+            captain_images[team] = image_path
+            captain_names[team] = alt_name or f"{_team_abbrev(team)} Captain"
+
     for team in (team1, team2):
         if team not in captain_names:
-            logger.info("Captain toss skip: no captain name for %s after Google+ESPN", team)
+            logger.info(
+                "Captain toss skip: no captain name for %s after Google+ESPN+Image fallback",
+                team,
+            )
             return None
 
-    return await _build_captain_toss_info(page, update_info, captain_names)
+    return await _build_captain_toss_info(page, update_info, captain_names, captain_images)
