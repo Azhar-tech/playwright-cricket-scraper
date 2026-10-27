@@ -2,7 +2,7 @@
 
 Cricket Live Score Facebook Agent
 
-
+g
 
 Setup:
 
@@ -493,7 +493,7 @@ def is_headless() -> bool:
 async def launch_stealth_browser(playwright) -> Browser:
     headless = is_headless()
     logger.info("Launching Chromium (headless=%s)", headless)
-    return await playwright.chromium.launch(headless=headless, args=STEALTH_LAUNCH_ARGS)
+    return await playwright.chromium.launch(headless=headless, args=STEALTH_LAUNCH_ARGS, channel="chromium")
 
 
 async def open_stealth_session(playwright) -> tuple[Browser | None, BrowserContext | None]:
